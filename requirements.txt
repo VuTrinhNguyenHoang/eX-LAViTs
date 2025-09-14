@@ -6,3 +6,4 @@ matplotlib
 pyyaml
 pandas
 scikit-learn
+pytest

@@ -425,7 +425,6 @@ def train_model(
         metrics_tracker.update(
             train_loss=train_metrics['loss'],
             val_loss=val_metrics['loss'] if val_metrics else None,
-            val_acc=val_metrics['top1_accuracy'] if val_metrics else None,
             lr=current_lr
         )
         

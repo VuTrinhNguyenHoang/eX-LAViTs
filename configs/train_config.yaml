@@ -13,7 +13,7 @@ model:
   projection_dropout: 0.0
   qkv_bias: true
   activation: "gelu"
-  layer_norm_eps: 1e-6
+  layer_norm_eps: 0.000001
   
   # Kernel for linear attention (LAViT only): elu or relu
   linear_attention_kernel: "elu"
@@ -22,12 +22,12 @@ model:
 training:
   epochs: 150
   batch_size: 64
-  learning_rate: 5e-4
-  weight_decay: 1e-4
+  learning_rate: 0.0005
+  weight_decay: 0.0001
   optimizer: "adamw"
   scheduler: "cosine"
   warmup_epochs: 15
-  min_lr: 1e-6
+  min_lr: 0.000001
   save_freq: 10
   print_freq: 50
   early_stopping: 20

@@ -113,11 +113,11 @@ def save_checkpoint(
         'timestamp': datetime.now().isoformat()
     }
     
-    torch.save(checkpoint, save_path)
-    
     if is_best:
         best_path = save_path.replace('.pth', '_best.pth')
         torch.save(checkpoint, best_path)
+    else:
+        torch.save(checkpoint, save_path)
 
 def load_checkpoint(
     checkpoint_path: str,
@@ -245,6 +245,7 @@ def train_epoch(
     
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
     
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -254,8 +255,10 @@ def train_epoch(
         output = model(images)
         loss = criterion(output, target)
         
-        # Measure record loss
+        # Measure accuracy and record loss
+        acc1, _ = accuracy(output, target, topk=(1, 5))
         losses.update(loss.item(), images.size(0))
+        top1.update(acc1.item(), images.size(0))
         
         # Compute gradient and do optimizer step
         optimizer.zero_grad()
@@ -269,7 +272,8 @@ def train_epoch(
         if i % print_freq == 0:
             msg = (f'Epoch: [{epoch}][{i}/{len(train_loader)}]\t'
                    f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
-                   f'Loss {losses.val:.4f} ({losses.avg:.4f})\t')
+                   f'Loss {losses.val:.4f} ({losses.avg:.4f})\t'
+                   f'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t')
             
             if logger:
                 logger.info(msg)
@@ -278,6 +282,7 @@ def train_epoch(
     
     return {
         'loss': losses.avg,
+        'top1_accuracy': top1.avg,
         'batch_time': batch_time.avg
     }
 
@@ -424,7 +429,9 @@ def train_model(
         # Update metrics tracker
         metrics_tracker.update(
             train_loss=train_metrics['loss'],
+            train_accuracy=train_metrics['top1_accuracy'],
             val_loss=val_metrics['loss'] if val_metrics else None,
+            val_accuracy=val_metrics['top1_accuracy'] if val_metrics else None,
             lr=current_lr
         )
         

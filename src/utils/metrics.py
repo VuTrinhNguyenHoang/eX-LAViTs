@@ -198,12 +198,18 @@ class MetricsTracker:
     def update(self, 
                train_loss: float = None,
                val_loss: float = None,
+               train_accuracy: float = None,
+               val_accuracy: float = None,
                lr: float = None):
         """Update metrics for current epoch."""
         if train_loss is not None:
             self.train_losses.append(train_loss)
         if val_loss is not None:
             self.val_losses.append(val_loss)
+        if train_accuracy is not None:
+            self.train_accuracies.append(train_accuracy)
+        if val_accuracy is not None:
+            self.val_accuracies.append(val_accuracy)
         if lr is not None:
             self.learning_rates.append(lr)
     
@@ -228,5 +234,13 @@ class MetricsTracker:
             summary['best_val_loss'] = min(self.val_losses)
             summary['final_val_loss'] = self.val_losses[-1]
             summary['best_val_loss_epoch'] = self.get_best_epoch('val_loss')
+        
+        if self.train_accuracies:
+            summary['best_train_accuracy'] = max(self.train_accuracies)
+            summary['final_train_accuracy'] = self.train_accuracies[-1]
+        
+        if self.val_accuracies:
+            summary['best_val_accuracy'] = max(self.val_accuracies)
+            summary['final_val_accuracy'] = self.val_accuracies[-1]
         
         return summary

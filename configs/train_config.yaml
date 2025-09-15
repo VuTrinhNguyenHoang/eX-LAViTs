@@ -1,0 +1,48 @@
+# Model Configuration
+model:
+  model_type: "StandardViT"
+  img_size: 32
+  num_classes: 10
+  patch_size: 4
+  embed_dim: 192
+  depth: 8
+  num_heads: 12
+  mlp_ratio: 4.0
+  dropout: 0.3
+  attention_dropout: 0.0
+  projection_dropout: 0.0
+  qkv_bias: true
+  activation: "gelu"
+  layer_norm_eps: 1e-6
+  
+  # Kernel for linear attention (LAViT only): elu or relu
+  linear_attention_kernel: "elu"
+
+# Training Configuration
+training:
+  epochs: 150
+  batch_size: 64
+  learning_rate: 5e-4
+  weight_decay: 1e-4
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 15
+  min_lr: 1e-6
+  save_freq: 10
+  print_freq: 50
+  early_stopping: 20
+
+# Data Configuration
+data:
+  data_dir: "./data"
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+
+# Experiment Configuration
+experiment:
+  experiment_dir: "experiments"
+  run_name: "run001"
+  resume: null
+  seed: 42
+  device: "auto"

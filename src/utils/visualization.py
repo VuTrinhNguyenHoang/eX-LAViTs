@@ -411,11 +411,11 @@ Model Information:
 • Depth: {model_info.get('depth', 'N/A')}
 
 Training Summary:
-• Best Train Accuracy: {summary.get('best_train_acc', 0):.2f}%
-• Best Val Accuracy: {summary.get('best_val_acc', 0):.2f}%
+• Best Train Accuracy: {summary.get('best_train_accuracy', 0):.2f}%
+• Best Val Accuracy: {summary.get('best_val_accuracy', 0):.2f}%
 • Final Train Loss: {summary.get('final_train_loss', 0):.4f}
 • Final Val Loss: {summary.get('final_val_loss', 0):.4f}
-• Best Val Acc Epoch: {summary.get('best_val_acc_epoch', 0) + 1}
+• Best Val Acc Epoch: {summary.get('best_val_accuracy_epoch', 0) + 1}
 """
     
     ax4.text(0.1, 0.9, info_text, transform=ax4.transAxes, fontsize=11,

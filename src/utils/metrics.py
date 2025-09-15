@@ -219,6 +219,10 @@ class MetricsTracker:
             return np.argmin(self.val_losses)
         elif metric == 'train_loss' and self.train_losses:
             return np.argmin(self.train_losses)
+        elif metric == 'val_acc' and self.val_accuracies:
+            return np.argmax(self.val_accuracies)
+        elif metric == 'train_acc' and self.train_accuracies:
+            return np.argmax(self.train_accuracies)
         else:
             return None
     
@@ -242,5 +246,6 @@ class MetricsTracker:
         if self.val_accuracies:
             summary['best_val_accuracy'] = max(self.val_accuracies)
             summary['final_val_accuracy'] = self.val_accuracies[-1]
+            summary['best_val_accuracy_epoch'] = self.get_best_epoch('val_acc')
         
         return summary

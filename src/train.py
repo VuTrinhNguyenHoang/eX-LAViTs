@@ -319,7 +319,7 @@ def main():
     print(f"Model: {args.model_type}")
     print(f"Run Directory: {run_dir}")
     print(f"Total Parameters: {total_params:,}")
-    print(f"Best Validation Accuracy: {summary.get('best_val_acc', 0):.2f}% (Epoch {summary.get('best_val_acc_epoch', 0) + 1})")
+    print(f"Best Validation Accuracy: {summary.get('best_val_accuracy', 0):.2f}% (Epoch {summary.get('best_val_accuracy_epoch', 0) + 1})")
     print(f"Final Test Accuracy: {test_results['top1_accuracy']:.2f}%")
     print(f"Test F1-Score (Macro): {classification_metrics['macro_f1']:.2f}%")
     print("="*60)

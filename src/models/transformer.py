@@ -25,7 +25,7 @@ class LinearMultiheadAttention(nn.Module):
         self.qkv = nn.Linear(embed_dim, embed_dim * 3, bias=qkv_bias)
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.attn_drop_p = attn_drop
+        self.attn_drop = nn.Dropout(attn_drop)
 
     def _phi(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, H, N, D]
@@ -43,19 +43,15 @@ class LinearMultiheadAttention(nn.Module):
         qkv = self.qkv(x).reshape(B, N, 3, self.h, self.d).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
 
-        qf = self._phi(q)  # [B,H,N,D]
-        kf = self._phi(k)  # [B,H,N,D]
+        qf = self._phi(q)                  # [B,H,N,D]
+        kf = self.attn_drop(self._phi(k))  # [B,H,N,D]
 
-        # Linear attention: O(N*D^2) instead of O(N^2*D)
-        # First compute K^T V for each head: [B,H,D,D]
-        kv = torch.einsum("bhnd,bhne->bhde", kf, v)
-        
-        # Then compute Q * (K^T V): [B,H,N,D]
-        y_num = torch.einsum("bhnd,bhde->bhne", qf, kv)
-        
-        # Compute normalization: sum of k for each position
-        z = kf.sum(dim=2, keepdim=True)  # [B,H,1,D]
-        y_den = torch.einsum("bhnd,bhd->bhn", qf, z.squeeze(2)).unsqueeze(-1) + self.eps
+        # Accumulate in fp32 under AMP for stability, then cast back. :contentReference[oaicite:2]{index=2}
+        kv = (kf.float().transpose(-1, -2) @ v.float()).to(v.dtype)     # [B,H,D,D]
+        y_num = (qf @ kv)                                               # [B,H,N,D]
+        z = kf.float().sum(dim=2)                                       # [B,H,D]
+        y_den = (qf * z.to(qf.dtype).unsqueeze(2)).sum(dim=-1, keepdim=True)
+        y_den = y_den.clamp_min(self.eps)                               # avoid div by 0
 
         y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)  # [B,N,C]
         y = self.out_proj(y)
@@ -183,9 +179,8 @@ def build_transformer_encoder(
 ):
     if attn_type == "linear":
         # Create custom encoder with LinearTransformerEncoderLayer
-        layers = []
-        for _ in range(depth):
-            layer = LinearTransformerEncoderLayer(
+        layers = [
+            LinearTransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_heads,
                 dim_feedforward=int(embed_dim * mlp_ratio),
@@ -197,19 +192,20 @@ def build_transformer_encoder(
                 proj_drop=proj_drop,
                 qkv_bias=qkv_bias,
                 kernel=kernel
-            )
-            layers.append(layer)
+            ) for _ in range(depth)
+        ]
         
-        encoder = nn.ModuleList(layers)
-        
-        # Add a forward method to the ModuleList to make it behave like TransformerEncoder
-        def forward(x):
-            for layer in encoder:
-                x = layer(x)
-            return x
-        
-        encoder.forward = forward
-        return encoder
+        class _Encoder(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.layers = nn.ModuleList(layers)
+            
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                for layer in self.layers:
+                    x = layer(x)
+                return x
+            
+        return _Encoder(layers)
     else:
         # Use standard PyTorch TransformerEncoder
         layer = build_encoder_layer(

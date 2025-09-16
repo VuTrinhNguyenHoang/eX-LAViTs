@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.models.vit import StandardViT, LAViT
 from src.utils.training import (
     create_run_directory, setup_logging, save_config, get_optimizer, 
-    get_scheduler, train_model, count_parameters
+    get_scheduler, train_model, count_parameters, get_model_info, load_checkpoint
 )
 from src.utils.metrics import compute_loss_and_accuracy, compute_classification_metrics
 from src.utils.visualization import save_all_plots, create_training_summary_plot
@@ -214,7 +214,6 @@ def main():
     start_epoch = 0
     if args.resume:
         logger.info(f"Resuming from checkpoint: {args.resume}")
-        from utils.training import load_checkpoint
         checkpoint = load_checkpoint(args.resume, model, optimizer, scheduler, device)
         start_epoch = checkpoint['epoch']
         logger.info(f"Resumed from epoch {start_epoch}")
@@ -292,22 +291,25 @@ def main():
         class_names=class_names
     )
     
-    # Create comprehensive training summary plot
-    model_info = {
-        'model_type': args.model_type,
-        'total_params': total_params,
-        'img_size': args.img_size,
-        'patch_size': args.patch_size,
-        'embed_dim': args.embed_dim,
-        'num_heads': args.num_heads,
-        'depth': args.depth
-    }
+    # Create comprehensive training summary plot with enhanced information
+    model_info = get_model_info(model, args)
+    
+    # Add dataset information
+    train_dataset_size = len(train_loader.dataset) if hasattr(train_loader, 'dataset') else 'N/A'
+    val_dataset_size = len(val_loader.dataset) if val_loader and hasattr(val_loader, 'dataset') else 'N/A'
+    
+    model_info.update({
+        'train_samples': train_dataset_size,
+        'val_samples': val_dataset_size,
+    })
     
     summary_plot = create_training_summary_plot(metrics_tracker, model_info)
     summary_plot.savefig(
         os.path.join(run_dir, 'plots', 'training_summary.png'),
         bbox_inches='tight', dpi=300
     )
+    
+    logger.info(f"Saved training summary to: {os.path.join(run_dir, 'plots', 'training_summary.png')}")
     
     logger.info(f"Saved plots to: {os.path.join(run_dir, 'plots')}")
     
@@ -322,6 +324,16 @@ def main():
     print(f"Best Validation Accuracy: {summary.get('best_val_accuracy', 0):.2f}% (Epoch {summary.get('best_val_accuracy_epoch', 0) + 1})")
     print(f"Final Test Accuracy: {test_results['top1_accuracy']:.2f}%")
     print(f"Test F1-Score (Macro): {classification_metrics['macro_f1']:.2f}%")
+    
+    # Add timing and memory information
+    if summary.get('total_training_time'):
+        print(f"Total Training Time: {summary.get('total_training_time', 0):.1f} seconds")
+        print(f"Average Epoch Time: {summary.get('avg_epoch_time', 0):.2f} seconds")
+    
+    if summary.get('peak_memory_usage'):
+        print(f"Peak Memory Usage: {summary.get('peak_memory_usage', 0):.0f} MB")
+        print(f"Average Memory Usage: {summary.get('avg_memory_usage', 0):.0f} MB")
+    
     print("="*60)
     
     logger.info("Training script completed successfully!")

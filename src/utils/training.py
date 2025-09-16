@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 import yaml
 
-from .metrics import AverageMeter, accuracy, compute_loss_and_accuracy, MetricsTracker
+from .metrics import AverageMeter, accuracy, compute_loss_and_accuracy, MetricsTracker, get_memory_usage
 
 def create_run_directory(base_dir: str = "experiments", run_name: Optional[str] = "test") -> str:
     """
@@ -247,7 +247,9 @@ def train_epoch(
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
     
+    epoch_start_time = time.time()
     end = time.time()
+    
     for i, (images, target) in enumerate(train_loader):
         images, target = images.to(device), target.to(device)
         
@@ -270,20 +272,25 @@ def train_epoch(
         end = time.time()
         
         if i % print_freq == 0:
+            memory_usage = get_memory_usage()
             msg = (f'Epoch: [{epoch}][{i}/{len(train_loader)}]\t'
                    f'Time {batch_time.val:.3f} ({batch_time.avg:.3f})\t'
                    f'Loss {losses.val:.4f} ({losses.avg:.4f})\t'
-                   f'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t')
+                   f'Acc@1 {top1.val:.3f} ({top1.avg:.3f})\t'
+                   f'Memory {memory_usage:.0f}MB')
             
             if logger:
                 logger.info(msg)
             else:
                 print(msg)
     
+    epoch_time = time.time() - epoch_start_time
+    
     return {
         'loss': losses.avg,
         'top1_accuracy': top1.avg,
-        'batch_time': batch_time.avg
+        'batch_time': batch_time.avg,
+        'epoch_time': epoch_time
     }
 
 def validate(
@@ -311,10 +318,11 @@ def validate(
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
     
     # Switch to evaluate mode
     model.eval()
+    
+    validation_start_time = time.time()
     
     with torch.no_grad():
         end = time.time()
@@ -329,17 +337,19 @@ def validate(
             acc1, acc5 = accuracy(output, target, topk=(1, 5))
             losses.update(loss.item(), images.size(0))
             top1.update(acc1.item(), images.size(0))
-            top5.update(acc5.item(), images.size(0))
             
             # Measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
     
+    validation_time = time.time() - validation_start_time
+    memory_usage = get_memory_usage()
+    
     msg = (f'Validation: [{epoch}]\t'
-           f'Time {batch_time.avg:.3f}\t'
+           f'Time {batch_time.avg:.3f} (Total: {validation_time:.2f}s)\t'
            f'Loss {losses.avg:.4f}\t'
            f'Acc@1 {top1.avg:.3f}\t'
-           f'Acc@5 {top5.avg:.3f}')
+           f'Memory {memory_usage:.0f}MB')
     
     if logger:
         logger.info(msg)
@@ -349,8 +359,8 @@ def validate(
     return {
         'loss': losses.avg,
         'top1_accuracy': top1.avg,
-        'top5_accuracy': top5.avg,
-        'batch_time': batch_time.avg
+        'batch_time': batch_time.avg,
+        'validation_time': validation_time
     }
 
 
@@ -397,6 +407,8 @@ def train_model(
     models_dir = os.path.join(run_dir, 'models')
     
     for epoch in range(num_epochs):
+        epoch_start_time = time.time()  # Start timing the epoch
+        
         if logger:
             logger.info(f'Starting epoch {epoch + 1}/{num_epochs}')
         
@@ -426,16 +438,20 @@ def train_model(
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         
-        # Update metrics tracker
+        # Calculate epoch time and get memory usage
+        epoch_time = time.time() - epoch_start_time
+        memory_usage = get_memory_usage()
+        
+        # Update metrics tracker with enhanced information
         metrics_tracker.update(
             train_loss=train_metrics['loss'],
             train_accuracy=train_metrics['top1_accuracy'],
             val_loss=val_metrics['loss'] if val_metrics else None,
             val_accuracy=val_metrics['top1_accuracy'] if val_metrics else None,
-            lr=current_lr
-        )
-        
-        # Check for best model
+            lr=current_lr,
+            epoch_time=epoch_time,
+            memory_usage=memory_usage
+        )        # Check for best model
         is_best = False
         if val_metrics:
             val_acc = val_metrics['top1_accuracy']
@@ -477,9 +493,11 @@ def train_model(
             break
         
         if logger:
-            logger.info(f'Epoch {epoch + 1} completed. Train Loss: {train_metrics["loss"]:.4f}' +
+            logger.info(f'Epoch {epoch + 1} completed. '
+                       f'Train Loss: {train_metrics["loss"]:.4f}' +
                        (f', Val Loss: {val_metrics["loss"]:.4f}, Val Acc: {val_metrics["top1_accuracy"]:.2f}%' 
-                        if val_metrics else ''))
+                        if val_metrics else '') +
+                       f', Epoch Time: {epoch_time:.2f}s, Memory: {memory_usage:.0f}MB')
     
     return metrics_tracker
 
@@ -488,3 +506,40 @@ def count_parameters(model):
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     return total_params, trainable_params
+
+def get_model_info(model, args=None):
+    """
+    Get comprehensive model information for visualization.
+    
+    Args:
+        model: PyTorch model
+        args: Training arguments/config (optional)
+        
+    Returns:
+        Dictionary containing model information
+    """
+    total_params, trainable_params = count_parameters(model)
+    
+    model_info = {
+        'model_type': getattr(args, 'model_type', model.__class__.__name__),
+        'total_params': total_params,
+        'trainable_params': trainable_params,
+        'img_size': getattr(args, 'img_size', getattr(model, 'img_size', 'N/A')),
+        'patch_size': getattr(args, 'patch_size', getattr(model, 'patch_size', 'N/A')),
+        'embed_dim': getattr(args, 'embed_dim', getattr(model, 'embed_dim', 'N/A')),
+        'num_heads': getattr(args, 'num_heads', getattr(model, 'num_heads', 'N/A')),
+        'depth': getattr(args, 'depth', getattr(model, 'depth', 'N/A')),
+        'num_classes': getattr(args, 'num_classes', getattr(model, 'num_classes', 'N/A')),
+    }
+    
+    # Add training-specific info if args is provided
+    if args:
+        model_info.update({
+            'batch_size': getattr(args, 'batch_size', 'N/A'),
+            'optimizer': getattr(args, 'optimizer', 'N/A'),
+            'scheduler': getattr(args, 'scheduler', 'N/A'),
+            'learning_rate': getattr(args, 'learning_rate', 'N/A'),
+            'weight_decay': getattr(args, 'weight_decay', 'N/A'),
+        })
+    
+    return model_info

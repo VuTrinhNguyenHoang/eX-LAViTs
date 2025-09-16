@@ -65,20 +65,6 @@ class _ViTCore(nn.Module):
 
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
-    
-    def forward_features(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # x: [B,C,H,W]
-        B = x.size(0)
-        x = self.patch_embed(x)                # [B,N,C]
-        cls = self.cls_token.expand(B, -1, -1) # [B,1,C]
-        x = torch.cat([cls, x], dim=1)         # [B,1+N,C]
-
-        x = x + self.pos_embed
-
-        x = self.encoder(x)                    # [B,1+N,C]
-        x = self.norm(x)
-        cls_out = x[:, 0]
-        return cls_out, x[:, 1:]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B = x.size(0)
@@ -87,6 +73,7 @@ class _ViTCore(nn.Module):
         x = torch.cat([cls, x], dim=1)
         x = x + self.pos_embed
         x = self.encoder(x)
+        x = self.norm(x)
 
         return self.head(x[:, 0])
     

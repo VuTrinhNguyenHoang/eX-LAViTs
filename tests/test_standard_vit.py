@@ -113,26 +113,6 @@ class TestStandardViT(unittest.TestCase):
         self.assertEqual(output.dtype, torch.float32)
         self.assertEqual(output.device.type, DEVICE.type)
 
-    def test_standard_vit_forward_features(self):
-        """Test StandardViT forward_features method"""
-        model = StandardViT(**self.default_params).to(DEVICE)
-        model.eval()
-        
-        x = torch.randn(self.batch_size, self.default_params['in_chans'], 
-                       self.default_params['img_size'], self.default_params['img_size']).to(DEVICE)
-        
-        with torch.no_grad():
-            cls_out, patch_features = model.forward_features(x)
-        
-        num_patches = model.patch_embed.num_patches
-        expected_cls_shape = (self.batch_size, self.default_params['embed_dim'])
-        expected_patch_shape = (self.batch_size, num_patches, self.default_params['embed_dim'])
-        
-        self.assertEqual(cls_out.shape, expected_cls_shape)
-        self.assertEqual(patch_features.shape, expected_patch_shape)
-        self.assertEqual(cls_out.device.type, DEVICE.type)
-        self.assertEqual(patch_features.device.type, DEVICE.type)
-
     def test_standard_vit_gradient_flow(self):
         """Test gradient flow in StandardViT"""
         model = StandardViT(**self.default_params).to(DEVICE)

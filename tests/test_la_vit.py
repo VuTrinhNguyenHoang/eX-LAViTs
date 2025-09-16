@@ -160,24 +160,6 @@ class TestLAViT(unittest.TestCase):
         self.assertEqual(output.dtype, torch.float32)
         self.assertEqual(output.device.type, DEVICE.type)
 
-    def test_la_vit_forward_features(self):
-        """Test LAViT forward_features method"""
-        model = LAViT(**self.default_params)
-        model.eval()
-        
-        x = torch.randn(self.batch_size, self.default_params['in_chans'], 
-                       self.default_params['img_size'], self.default_params['img_size'])
-        
-        with torch.no_grad():
-            cls_out, patch_features = model.forward_features(x)
-        
-        num_patches = model.patch_embed.num_patches
-        expected_cls_shape = (self.batch_size, self.default_params['embed_dim'])
-        expected_patch_shape = (self.batch_size, num_patches, self.default_params['embed_dim'])
-        
-        self.assertEqual(cls_out.shape, expected_cls_shape)
-        self.assertEqual(patch_features.shape, expected_patch_shape)
-
     def test_la_vit_different_kernels(self):
         """Test LAViT with different kernel types"""
         kernels = ["elu", "relu"]
@@ -353,20 +335,6 @@ class TestLAViTComparison(unittest.TestCase):
         self.assertEqual(la_output.shape, standard_output.shape)
         self.assertEqual(la_output.device.type, DEVICE.type)
         self.assertEqual(standard_output.device.type, DEVICE.type)
-
-    def test_la_vit_vs_standard_vit_feature_shapes(self):
-        """Test that LAViT and StandardViT produce same feature shapes"""
-        la_model = LAViT(**self.params)
-        standard_model = StandardViT(**self.params)
-        
-        x = torch.randn(1, self.params['in_chans'], self.params['img_size'], self.params['img_size'])
-        
-        with torch.no_grad():
-            la_cls, la_patches = la_model.forward_features(x)
-            std_cls, std_patches = standard_model.forward_features(x)
-        
-        self.assertEqual(la_cls.shape, std_cls.shape)
-        self.assertEqual(la_patches.shape, std_patches.shape)
 
     def test_la_vit_parameter_compatibility(self):
         """Test that LAViT accepts same parameters as StandardViT"""

@@ -2,6 +2,8 @@ import torch
 import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix
 from typing import Dict, Any, Optional, Tuple
+import psutil
+import os
 
 class AverageMeter:
     """Computes and stores the average and current value."""
@@ -194,13 +196,17 @@ class MetricsTracker:
         self.train_accuracies = []
         self.val_accuracies = []
         self.learning_rates = []
+        self.epoch_times = []
+        self.memory_usage = []
     
     def update(self, 
                train_loss: float = None,
                val_loss: float = None,
                train_accuracy: float = None,
                val_accuracy: float = None,
-               lr: float = None):
+               lr: float = None,
+               epoch_time: float = None,
+               memory_usage: float = None):
         """Update metrics for current epoch."""
         if train_loss is not None:
             self.train_losses.append(train_loss)
@@ -212,6 +218,10 @@ class MetricsTracker:
             self.val_accuracies.append(val_accuracy)
         if lr is not None:
             self.learning_rates.append(lr)
+        if epoch_time is not None:
+            self.epoch_times.append(epoch_time)
+        if memory_usage is not None:
+            self.memory_usage.append(memory_usage)
     
     def get_best_epoch(self, metric: str = 'val_loss') -> int:
         """Get epoch with best performance for given metric."""
@@ -248,4 +258,33 @@ class MetricsTracker:
             summary['final_val_accuracy'] = self.val_accuracies[-1]
             summary['best_val_accuracy_epoch'] = self.get_best_epoch('val_acc')
         
+        if self.epoch_times:
+            summary['total_training_time'] = sum(self.epoch_times)
+            summary['avg_epoch_time'] = np.mean(self.epoch_times)
+            summary['min_epoch_time'] = min(self.epoch_times)
+            summary['max_epoch_time'] = max(self.epoch_times)
+        
+        if self.memory_usage:
+            summary['peak_memory_usage'] = max(self.memory_usage)
+            summary['avg_memory_usage'] = np.mean(self.memory_usage)
+        
         return summary
+
+def get_memory_usage() -> float:
+    """
+    Get current memory usage in MB.
+    
+    Returns:
+        Memory usage in MB
+    """
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        return memory_info.rss / 1024 / 1024  # Convert to MB
+    except ImportError:
+        # Fallback for systems without psutil
+        if torch.cuda.is_available():
+            return torch.cuda.memory_allocated() / 1024 / 1024  # GPU memory in MB
+        else:
+            return 0.0  # Unable to get memory info

@@ -357,7 +357,7 @@ def create_training_summary_plot(
     """
     fig = plt.figure(figsize=figsize, dpi=dpi)
     
-    # Create subplots
+    # Create subplots - now with 2x3 grid
     gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
     
     epochs = range(1, len(metrics_tracker.train_losses) + 1)
@@ -394,14 +394,13 @@ def create_training_summary_plot(
         ax3.set_yscale('log')
         ax3.grid(True, alpha=0.3)
     
-    # Model information text
-    ax4 = fig.add_subplot(gs[1, :])
+    # Model information text (left side of bottom row)
+    ax4 = fig.add_subplot(gs[1, 0])
     ax4.axis('off')
     
     # Create summary text
     summary = metrics_tracker.get_summary()
-    info_text = f"""
-Model Information:
+    info_text = f"""Model Information:
 • Model Type: {model_info.get('model_type', 'N/A')}
 • Total Parameters: {model_info.get('total_params', 'N/A'):,} 
 • Image Size: {model_info.get('img_size', 'N/A')}
@@ -415,13 +414,40 @@ Training Summary:
 • Best Val Accuracy: {summary.get('best_val_accuracy', 0):.2f}%
 • Final Train Loss: {summary.get('final_train_loss', 0):.4f}
 • Final Val Loss: {summary.get('final_val_loss', 0):.4f}
-• Best Val Acc Epoch: {summary.get('best_val_accuracy_epoch', 0) + 1}
-"""
+• Best Val Acc Epoch: {summary.get('best_val_accuracy_epoch', 0) + 1}"""
     
-    ax4.text(0.1, 0.9, info_text, transform=ax4.transAxes, fontsize=11,
+    ax4.text(0.05, 0.95, info_text, transform=ax4.transAxes, fontsize=9,
              verticalalignment='top', fontfamily='monospace',
              bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
     
+    # Training time plot (bottom middle)
+    if metrics_tracker.epoch_times:
+        ax5 = fig.add_subplot(gs[1, 1])
+        ax5.plot(epochs, metrics_tracker.epoch_times, 'purple', marker='o', linewidth=2, markersize=4)
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('Time (seconds)')
+        ax5.set_title('Training Time per Epoch')
+        ax5.grid(True, alpha=0.3)
+        
+        # Add average line
+        avg_time = np.mean(metrics_tracker.epoch_times)
+        ax5.axhline(y=avg_time, color='orange', linestyle='--', alpha=0.7, label=f'Avg: {avg_time:.1f}s')
+        ax5.legend()
+    
+    # Memory usage plot (bottom right)
+    if metrics_tracker.memory_usage:
+        ax6 = fig.add_subplot(gs[1, 2])
+        ax6.plot(epochs, metrics_tracker.memory_usage, 'red', marker='s', linewidth=2, markersize=4)
+        ax6.set_xlabel('Epoch')
+        ax6.set_ylabel('Memory Usage (MB)')
+        ax6.set_title('Memory Usage per Epoch')
+        ax6.grid(True, alpha=0.3)
+        
+        # Add peak line
+        peak_memory = max(metrics_tracker.memory_usage)
+        ax6.axhline(y=peak_memory, color='darkred', linestyle='--', alpha=0.7, label=f'Peak: {peak_memory:.0f}MB')
+        ax6.legend()
+
     plt.suptitle('Training Summary Report', fontsize=16, fontweight='bold')
     
     if save_path:

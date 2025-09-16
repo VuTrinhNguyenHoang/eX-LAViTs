@@ -8,3 +8,4 @@ pyyaml
 pandas
 scikit-learn
 pytest
+psutil

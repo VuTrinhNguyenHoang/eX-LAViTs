@@ -1,0 +1,41 @@
+# Dataset Configuration
+dataset:
+  name: "cifar10"
+  data_dir: "./data"
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+
+# Model Configuration - Pretrained ViT
+model:
+  model_name: "vit_small_patch16_224"
+  pretrained: true
+  use_linear_attention: true
+  linear_attention_kernel: "elu"
+  
+  img_size: 32
+  num_classes: 10
+  dropout: 0.1
+  drop_path_rate: 0.1
+
+# Training Configuration
+training:
+  epochs: 50
+  batch_size: 64
+  learning_rate: 0.00005
+  weight_decay: 0.02 
+  optimizer: "adamw"
+  scheduler: "cosine"
+  warmup_epochs: 5 
+  min_lr: 0.000001
+  save_freq: 5
+  print_freq: 50
+  early_stopping: 10
+
+# Experiment Configuration
+experiment:
+  experiment_dir: "experiments"
+  run_name: "run001"
+  resume: null
+  seed: 42
+  device: "auto"

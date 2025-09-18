@@ -9,3 +9,4 @@ pandas
 scikit-learn
 pytest
 psutil
+timm

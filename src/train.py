@@ -17,7 +17,7 @@ from src.utils.training import (
 )
 from src.utils.metrics import compute_loss_and_accuracy, compute_classification_metrics
 from src.utils.visualization import save_all_plots, create_training_summary_plot
-from datasets.cifar10 import get_cifar10_dataloaders, get_cifar10_info
+from datasets import get_dataset, DATASETS
 
 def load_config(config_path):
     """Load configuration from YAML file."""
@@ -38,6 +38,14 @@ def dict_to_namespace(d):
 def create_args_from_config(config):
     """Create args namespace from config dictionary with flattened structure."""
     args = SimpleNamespace()
+    
+    # Dataset arguments
+    dataset_config = config.get('dataset', {})
+    args.dataset_name = dataset_config.get('name', 'cifar10')
+    args.data_dir = dataset_config.get('data_dir', './data')
+    args.val_split = dataset_config.get('val_split', 0.1)
+    args.num_workers = dataset_config.get('num_workers', 4)
+    args.pin_memory = dataset_config.get('pin_memory', True)
     
     # Model arguments
     model_config = config.get('model', {})
@@ -70,13 +78,6 @@ def create_args_from_config(config):
     args.save_freq = training_config.get('save_freq', 10)
     args.print_freq = training_config.get('print_freq', 50)
     args.early_stopping = training_config.get('early_stopping', None)
-    
-    # Data arguments
-    data_config = config.get('data', {})
-    args.data_dir = data_config.get('data_dir', './data')
-    args.val_split = data_config.get('val_split', 0.1)
-    args.num_workers = data_config.get('num_workers', 4)
-    args.pin_memory = data_config.get('pin_memory', True)
     
     # Experiment arguments
     experiment_config = config.get('experiment', {})
@@ -118,7 +119,7 @@ def create_model(args):
     return model
 
 def main():
-    parser = argparse.ArgumentParser(description='Train ViT models on CIFAR-10')
+    parser = argparse.ArgumentParser(description='Train ViT models on various datasets (CIFAR-10/100, Food-101, STL-10)')
     parser.add_argument('--config', type=str, default='configs/train_config.yaml',
                        help='Path to configuration file')
     
@@ -162,16 +163,35 @@ def main():
     logger.info(f"Saved configuration to: {config_path}")
     
     # Create data loaders
-    logger.info("Creating data loaders...")
-    train_loader, val_loader, test_loader = get_cifar10_dataloaders(
-        data_dir=args.data_dir,
-        img_size=args.img_size,
-        batch_size=args.batch_size,
-        val_split=args.val_split,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_memory,
-        download=True
-    )
+    logger.info(f"Creating data loaders for {args.dataset_name}...")
+    
+    try:
+        loaders, dataset_info = get_dataset(
+            args.dataset_name,
+            data_dir=args.data_dir,
+            img_size=args.img_size,
+            batch_size=args.batch_size,
+            val_split=args.val_split,
+            num_workers=args.num_workers,
+            pin_memory=args.pin_memory,
+            download=True
+        )
+        
+        train_loader, val_loader, test_loader = loaders
+        
+        # Validate that num_classes matches dataset
+        if args.num_classes != dataset_info['num_classes']:
+            logger.warning(f"Model num_classes ({args.num_classes}) doesn't match dataset ({dataset_info['num_classes']}). Using dataset value.")
+            args.num_classes = dataset_info['num_classes']
+        
+        # Validate image size
+        expected_shape = dataset_info['input_shape']
+        if expected_shape[1] != args.img_size or expected_shape[2] != args.img_size:
+            logger.warning(f"Model img_size ({args.img_size}) doesn't match dataset default ({expected_shape[1]}x{expected_shape[2]})")
+            
+    except Exception as e:
+        logger.error(f"Failed to load dataset {args.dataset_name}: {e}")
+        raise
     
     logger.info(f"Train batches: {len(train_loader)}")
     logger.info(f"Validation batches: {len(val_loader) if val_loader else 0}")
@@ -246,8 +266,7 @@ def main():
     )
     
     # Compute detailed classification metrics
-    cifar10_info = get_cifar10_info()
-    class_names = cifar10_info['classes']
+    class_names = dataset_info.get('classes', [f'Class_{i}' for i in range(dataset_info['num_classes'])])
     
     classification_metrics = compute_classification_metrics(
         test_results['predictions'],
@@ -299,8 +318,11 @@ def main():
     val_dataset_size = len(val_loader.dataset) if val_loader and hasattr(val_loader, 'dataset') else 'N/A'
     
     model_info.update({
+        'dataset_name': args.dataset_name,
         'train_samples': train_dataset_size,
         'val_samples': val_dataset_size,
+        'dataset_classes': dataset_info['num_classes'],
+        'dataset_shape': dataset_info['input_shape'],
     })
     
     summary_plot = create_training_summary_plot(metrics_tracker, model_info)
@@ -318,9 +340,12 @@ def main():
     print("\n" + "="*60)
     print("TRAINING SUMMARY")
     print("="*60)
+    print(f"Dataset: {args.dataset_name.upper()}")
     print(f"Model: {args.model_type}")
     print(f"Run Directory: {run_dir}")
     print(f"Total Parameters: {total_params:,}")
+    print(f"Dataset Classes: {dataset_info['num_classes']}")
+    print(f"Image Size: {args.img_size}x{args.img_size}")
     print(f"Best Validation Accuracy: {summary.get('best_val_accuracy', 0):.2f}% (Epoch {summary.get('best_val_accuracy_epoch', 0) + 1})")
     print(f"Final Test Accuracy: {test_results['top1_accuracy']:.2f}%")
     print(f"Test F1-Score (Macro): {classification_metrics['macro_f1']:.2f}%")

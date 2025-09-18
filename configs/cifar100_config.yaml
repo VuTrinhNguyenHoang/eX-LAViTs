@@ -1,16 +1,24 @@
+# Dataset Configuration
+dataset:
+  name: "cifar100"
+  data_dir: "./data"
+  val_split: 0.1
+  num_workers: 4
+  pin_memory: true
+
 # Model Configuration
 model:
   model_type: "StandardViT"
   img_size: 32
-  num_classes: 10
+  num_classes: 100
   patch_size: 4
-  embed_dim: 192
-  depth: 8
-  num_heads: 12
+  embed_dim: 512
+  depth: 12 
+  num_heads: 8  
   mlp_ratio: 4.0
-  dropout: 0.3
-  attention_dropout: 0.3
-  projection_dropout: 0.3
+  dropout: 0.1   
+  attention_dropout: 0.1
+  projection_dropout: 0.1
   qkv_bias: true
   activation: "gelu"
   layer_norm_eps: 0.000001
@@ -20,24 +28,17 @@ model:
 
 # Training Configuration
 training:
-  epochs: 150
-  batch_size: 64
-  learning_rate: 0.0005
-  weight_decay: 0.001
+  epochs: 300     
+  batch_size: 32 
+  learning_rate: 0.0003 
+  weight_decay: 0.05  
   optimizer: "adamw"
   scheduler: "cosine"
-  warmup_epochs: 15
+  warmup_epochs: 20
   min_lr: 0.00000001
-  save_freq: 10
+  save_freq: 20
   print_freq: 50
-  early_stopping: 20
-
-# Data Configuration
-data:
-  data_dir: "./data"
-  val_split: 0.1
-  num_workers: 4
-  pin_memory: true
+  early_stopping: 30
 
 # Experiment Configuration
 experiment:

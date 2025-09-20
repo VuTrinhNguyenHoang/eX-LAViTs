@@ -16,7 +16,7 @@ class LinearMultiheadAttention(nn.Module):
         eps: float = 1e-6,
     ):
         super().__init__()
-        assert embed_dim % num_heads == 0
+        assert embed_dim % num_heads == 0, "embed_dim must be divisible by num_heads"
         self.h = num_heads
         self.d = embed_dim // num_heads
         self.kernel = kernel
@@ -28,32 +28,41 @@ class LinearMultiheadAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
 
     def _phi(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, H, N, D]
+        # Ensure non-negativity for kernel feature maps
         if self.kernel == "elu":
-            return F.elu(x, 1.0) + 1.0
+            return F.elu(x, alpha=1.0) + 1.0
         elif self.kernel == "relu":
             return F.relu(x)
         else:
-            # Default behavior for invalid kernels: use identity (just return x)
-            # This ensures the function always returns a tensor
-            return x
-        
-    def forward(self, x: torch.Tensor):
+            raise ValueError(f"Unsupported kernel: {self.kernel}")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.h, self.d).permute(2, 0, 3, 1, 4)
+        qkv = (
+            self.qkv(x)
+            .reshape(B, N, 3, self.h, self.d)
+            .permute(2, 0, 3, 1, 4)
+        )
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
 
         qf = self._phi(q)                  # [B,H,N,D]
-        kf = self.attn_drop(self._phi(k))  # [B,H,N,D]
+        kf = self._phi(k)                  # [B,H,N,D]
+        kf = self.attn_drop(kf)
 
-        # Accumulate in fp32 under AMP for stability, then cast back. :contentReference[oaicite:2]{index=2}
-        kv = (kf.float().transpose(-1, -2) @ v.float()).to(v.dtype)     # [B,H,D,D]
-        y_num = (qf @ kv)                                               # [B,H,N,D]
-        z = kf.float().sum(dim=2)                                       # [B,H,D]
-        y_den = (qf * z.to(qf.dtype).unsqueeze(2)).sum(dim=-1, keepdim=True)
-        y_den = y_den.clamp_min(self.eps)                               # avoid div by 0
+        # kv term: [B,H,D,D]
+        kv = torch.matmul(kf.float().transpose(-1, -2), v.float())
+        kv = kv.to(v.dtype)
 
-        y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)  # [B,N,C]
+        # numerator: [B,H,N,D]
+        y_num = torch.matmul(qf, kv)
+
+        # denominator: [B,H,N,1]
+        z = kf.float().sum(dim=2)                          # [B,H,D]
+        y_den = torch.einsum("bhnd,bhd->bhn", qf, z.to(qf.dtype))  # [B,H,N]
+        y_den = y_den.unsqueeze(-1).clamp_min(self.eps)    # [B,H,N,1]
+
+        # output: [B,N,C]
+        y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)
         y = self.out_proj(y)
         y = self.proj_drop(y)
 

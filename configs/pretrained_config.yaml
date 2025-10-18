@@ -31,6 +31,8 @@ training:
   save_freq: 5
   print_freq: 50
   early_stopping: 10
+  warmup_last4_epochs: 5
+  warmup_lr_mult: 0.5
 
 # Experiment Configuration
 experiment:

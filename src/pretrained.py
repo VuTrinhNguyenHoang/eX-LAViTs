@@ -78,6 +78,10 @@ def create_args_from_config(config):
     args.print_freq = training_config.get('print_freq', 50)
     args.early_stopping = training_config.get('early_stopping', None)
     
+    # Warmup
+    args.warmup_last4_epochs = training_config.get('warmup_last4_epochs', 5)  # số epoch chỉ train 4 block cuối
+    args.warmup_lr_mult = training_config.get('warmup_lr_mult', 0.5)
+
     # Experiment arguments
     experiment_config = config.get('experiment', {})
     args.experiment_dir = experiment_config.get('experiment_dir', 'experiments')
@@ -140,6 +144,51 @@ def create_pretrained_model(args, logger=None):
             for model_name in available_models[:10]:  # Show first 10
                 logger.info(f"  - {model_name}")
         raise
+
+def set_requires_grad(module: nn.Module, flag: bool):
+    for p in module.parameters():
+        p.requires_grad = flag
+
+def freeze_all_except_last_k_blocks(model: nn.Module, k: int = 4, logger=None):
+    if not hasattr(model, 'blocks'):
+        raise AttributeError("Model không có attribute 'blocks'.")
+    n = len(model.blocks)
+    for i, blk in enumerate(model.blocks):
+        set_requires_grad(blk, i >= n - k)
+    # giữ head và norm trainable
+    for name in ['head', 'fc', 'norm']:
+        if hasattr(model, name):
+            set_requires_grad(getattr(model, name), True)
+    # patch embed và pos_embed frozen
+    if hasattr(model, 'patch_embed'):
+        set_requires_grad(model.patch_embed, False)
+    if hasattr(model, 'pos_embed') and isinstance(model.pos_embed, torch.nn.Parameter):
+        model.pos_embed.requires_grad = False
+    if logger:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"[Warmup] Trainable params with last {k} blocks: {trainable_params:,}")
+
+def unfreeze_all(model: nn.Module, logger=None):
+    for p in model.parameters():
+        p.requires_grad = True
+    if logger:
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        logger.info(f"[Finetune] Trainable params (all): {trainable_params:,}")
+
+def rebuild_optimizer_and_scheduler(model, args, epochs_for_phase, base_lr, logger=None):
+    optimizer = get_optimizer(
+        model,
+        optimizer_name=args.optimizer,
+        learning_rate=base_lr,
+        weight_decay=args.weight_decay
+    )
+    scheduler_kwargs = {}
+    if args.scheduler == 'cosine':
+        scheduler_kwargs = {'T_max': epochs_for_phase, 'eta_min': args.min_lr}
+    scheduler = get_scheduler(optimizer, args.scheduler, **scheduler_kwargs)
+    if logger:
+        logger.info(f"Built optimizer={type(optimizer).__name__}, lr={base_lr}, scheduler={type(scheduler).__name__ if scheduler else 'None'}, T_max={scheduler_kwargs.get('T_max', None)}")
+    return optimizer, scheduler
 
 def main():
     parser = argparse.ArgumentParser(description='Train pretrained ViT models on various datasets')
@@ -239,53 +288,63 @@ def main():
     # Create loss function
     criterion = nn.CrossEntropyLoss()
     
-    # Create optimizer
-    optimizer = get_optimizer(
-        model,
-        optimizer_name=args.optimizer,
-        learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay
-    )
-    
-    # Create scheduler
-    scheduler_kwargs = {}
-    if args.scheduler == 'cosine':
-        scheduler_kwargs = {
-            'T_max': args.epochs,
-            'eta_min': args.min_lr
-        }
-    
-    scheduler = get_scheduler(optimizer, args.scheduler, **scheduler_kwargs)
-    
-    logger.info(f"Created optimizer: {type(optimizer).__name__} (lr={args.learning_rate})")
-    logger.info(f"Created scheduler: {type(scheduler).__name__ if scheduler else 'None'}")
-    
-    # Resume from checkpoint if provided
-    start_epoch = 0
-    if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = load_checkpoint(args.resume, model, optimizer, scheduler, device)
-        start_epoch = checkpoint['epoch']
-        logger.info(f"Resumed from epoch {start_epoch}")
-    
+    # ===== Phase 1: Warm-up last 4 blocks =====
+    warmup_epochs = int(max(0, args.warmup_last4_epochs))
+    remaining_epochs = int(max(0, args.epochs - warmup_epochs))
+
     # Train model
     logger.info("Starting training...")
-    metrics_tracker = train_model(
-        model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        num_epochs=args.epochs,
-        run_dir=run_dir,
-        save_freq=args.save_freq,
-        print_freq=args.print_freq,
-        early_stopping_patience=args.early_stopping,
-        logger=logger
-    )
-    
+    if warmup_epochs > 0:
+        logger.info(f"Phase 1: Warm-up last 4 blocks for {warmup_epochs} epochs")
+        freeze_all_except_last_k_blocks(model, k=4, logger=logger)
+
+        base_lr_phase1 = args.learning_rate * float(args.warmup_lr_mult)
+        optimizer1, scheduler1 = rebuild_optimizer_and_scheduler(
+            model, args, warmup_epochs, base_lr_phase1, logger
+        )
+
+        metrics_phase1 = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer1,
+            scheduler=scheduler1,
+            device=device,
+            num_epochs=warmup_epochs,
+            run_dir=run_dir,
+            save_freq=args.save_freq,
+            print_freq=args.print_freq,
+            early_stopping_patience=args.early_stopping,
+            logger=logger
+        )
+        logger.info("Phase 1 completed.")
+
+    if remaining_epochs > 0:
+        logger.info(f"Phase 2: Unfreeze all and finetune for {remaining_epochs} epochs")
+        unfreeze_all(model, logger=logger)
+        base_lr_phase2 = args.learning_rate
+        optimizer2, scheduler2 = rebuild_optimizer_and_scheduler(
+            model, args, remaining_epochs, base_lr_phase2, logger
+        )
+
+        metrics_phase2 = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer2,
+            scheduler=scheduler2,
+            device=device,
+            num_epochs=remaining_epochs,
+            run_dir=run_dir,
+            save_freq=args.save_freq,
+            print_freq=args.print_freq,
+            early_stopping_patience=args.early_stopping,
+            logger=logger
+        )
+        logger.info("Phase 2 completed.")
+
     logger.info("Training completed!")
     
     # Evaluate on test set
@@ -335,7 +394,7 @@ def main():
     # Generate and save plots
     logger.info("Generating plots...")
     save_all_plots(
-        metrics_tracker=metrics_tracker,
+        metrics_tracker=metrics_phase2,
         run_dir=run_dir,
         y_true=test_results['targets'],
         y_pred=test_results['predictions'],
@@ -360,7 +419,7 @@ def main():
         'scheduler': args.scheduler,
     }
     
-    summary_plot = create_training_summary_plot(metrics_tracker, model_info)
+    summary_plot = create_training_summary_plot(metrics_phase2, model_info)
     summary_plot.savefig(
         os.path.join(run_dir, 'plots', 'training_summary.png'),
         bbox_inches='tight', dpi=300
@@ -370,7 +429,7 @@ def main():
     logger.info(f"Saved plots to: {os.path.join(run_dir, 'plots')}")
     
     # Print summary
-    summary = metrics_tracker.get_summary()
+    summary = metrics_phase2.get_summary()
     print("\n" + "="*70)
     print("PRETRAINED ViT TRAINING SUMMARY")
     print("="*70)

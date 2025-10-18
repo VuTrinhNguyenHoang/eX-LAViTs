@@ -19,8 +19,8 @@ def get_stl10_dataloaders(
     """
     
     # STL-10 statistics
-    stl10_mean = (0.4467, 0.4398, 0.4066)
-    stl10_std = (0.2603, 0.2566, 0.2713)
+    stl10_mean = (0.485, 0.456, 0.406)
+    stl10_std = (0.229, 0.224, 0.225)
     
     train_transform = transforms.Compose([
         transforms.RandomCrop(96, padding=12),

@@ -30,8 +30,8 @@ def get_cifar10_dataloaders(
     """
     
     # CIFAR-10 statistics
-    cifar10_mean = (0.4914, 0.4822, 0.4465)
-    cifar10_std = (0.2023, 0.1994, 0.2010)
+    cifar10_mean = (0.485, 0.456, 0.406)
+    cifar10_std = (0.229, 0.224, 0.225)
     
     # Train transforms
     train_transform = transforms.Compose([

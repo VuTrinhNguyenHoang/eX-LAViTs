@@ -16,8 +16,8 @@ def get_cifar100_dataloaders(
     """Create CIFAR-100 train, validation, and test dataloaders."""
     
     # CIFAR-100 statistics
-    cifar100_mean = (0.5071, 0.4867, 0.4408)
-    cifar100_std = (0.2675, 0.2565, 0.2761)
+    cifar100_mean = (0.485, 0.456, 0.406)
+    cifar100_std = (0.229, 0.224, 0.225)
     
     # Train transforms with stronger augmentation for more classes
     train_transform = transforms.Compose([

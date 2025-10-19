@@ -11,9 +11,10 @@ class LinearAttentionBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         qkv_bias: bool = True,
-        drop: float = 0.0,
+        proj_drop: float = 0.0,
         attn_drop: float = 0.0,
         drop_path: float = 0.0,
+        mlp_drop: float = 0.0,
         act_layer: nn.Module = nn.GELU,
         norm_layer: nn.Module = nn.LayerNorm,
         kernel: Literal["elu", "relu"] = "elu",
@@ -27,7 +28,7 @@ class LinearAttentionBlock(nn.Module):
             embed_dim=dim,
             num_heads=num_heads,
             attn_drop=attn_drop,
-            proj_drop=drop,
+            proj_drop=proj_drop,
             qkv_bias=qkv_bias,
             kernel=kernel,
             eps=eps,
@@ -42,7 +43,7 @@ class LinearAttentionBlock(nn.Module):
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
-            drop=drop
+            mlp_drop=mlp_drop
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
     
@@ -148,9 +149,10 @@ def replace_attention_layers(
                     num_heads=num_heads,
                     mlp_ratio=mlp_ratio,
                     qkv_bias=qkv_bias,
-                    drop=mlp_drop,
+                    mlp_drop=mlp_drop,
                     attn_drop=attn_drop,
                     drop_path=drop_path,
+                    proj_drop=proj_drop,
                     kernel=kernel,
                     eps=eps,
                 )

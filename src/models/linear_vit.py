@@ -43,7 +43,7 @@ class LinearAttentionBlock(nn.Module):
             in_features=dim,
             hidden_features=mlp_hidden_dim,
             act_layer=act_layer,
-            mlp_drop=mlp_drop
+            drop=mlp_drop
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
     

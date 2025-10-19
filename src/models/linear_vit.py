@@ -135,7 +135,7 @@ def replace_attention_layers(
                 attn_drop = block.attn.attn_drop.p if hasattr(block.attn, 'attn_drop') else 0.0
                 proj_drop = block.attn.proj_drop.p if hasattr(block.attn, 'proj_drop') else 0.0
                 drop_path = block.drop_path.drop_prob if hasattr(block, 'drop_path') else 0.0
-                mlp_drop = block.mlp.drop.p if hasattr(block.mlp, 'drop1') else 0.0
+                mlp_drop = block.mlp.drop1.p if hasattr(block.mlp, 'drop1') else 0.0
                 
                 # Tính mlp_ratio từ hidden size
                 mlp_ratio = block.mlp.fc1.out_features / dim if hasattr(block.mlp, 'fc1') else 4.0

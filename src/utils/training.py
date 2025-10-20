@@ -258,7 +258,7 @@ def train_epoch(
         loss = criterion(output, target)
         
         # Measure accuracy and record loss
-        acc1, _ = accuracy(output, target, topk=(1, 5))
+        acc1 = accuracy(output, target, topk=(1, ))
         losses.update(loss.item(), images.size(0))
         top1.update(acc1.item(), images.size(0))
         

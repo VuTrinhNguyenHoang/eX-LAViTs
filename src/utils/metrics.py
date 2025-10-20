@@ -148,7 +148,6 @@ def compute_loss_and_accuracy(
     
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
     
     all_preds = []
     all_targets = []
@@ -162,10 +161,9 @@ def compute_loss_and_accuracy(
             loss = criterion(output, target)
             
             # Measure accuracy and record loss
-            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            acc1 = accuracy(output, target, topk=(1, ))
             losses.update(loss.item(), images.size(0))
             top1.update(acc1.item(), images.size(0))
-            top5.update(acc5.item(), images.size(0))
             
             if return_predictions:
                 _, preds = torch.max(output, 1)
@@ -174,8 +172,7 @@ def compute_loss_and_accuracy(
     
     results = {
         'loss': losses.avg,
-        'top1_accuracy': top1.avg,
-        'top5_accuracy': top5.avg
+        'top1_accuracy': top1.avg
     }
     
     if return_predictions:

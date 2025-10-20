@@ -368,7 +368,6 @@ def main():
     logger.info(f"Test Results:")
     logger.info(f"  Loss: {test_results['loss']:.4f}")
     logger.info(f"  Top-1 Accuracy: {test_results['top1_accuracy']:.2f}%")
-    logger.info(f"  Top-5 Accuracy: {test_results['top5_accuracy']:.2f}%")
     logger.info(f"  Macro F1-Score: {classification_metrics['macro_f1']:.2f}%")
     logger.info(f"  Weighted F1-Score: {classification_metrics['weighted_f1']:.2f}%")
     
@@ -379,7 +378,6 @@ def main():
         'pretrained': args.pretrained,
         'test_loss': test_results['loss'],
         'test_top1_accuracy': test_results['top1_accuracy'],
-        'test_top5_accuracy': test_results['top5_accuracy'],
         'test_macro_f1': classification_metrics['macro_f1'],
         'test_weighted_f1': classification_metrics['weighted_f1'],
         'model_params': total_params,

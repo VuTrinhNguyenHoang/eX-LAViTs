@@ -403,11 +403,6 @@ def create_training_summary_plot(
     info_text = f"""Model Information:
 • Model Type: {model_info.get('model_type', 'N/A')}
 • Total Parameters: {model_info.get('total_params', 'N/A'):,} 
-• Image Size: {model_info.get('img_size', 'N/A')}
-• Patch Size: {model_info.get('patch_size', 'N/A')}
-• Embed Dim: {model_info.get('embed_dim', 'N/A')}
-• Num Heads: {model_info.get('num_heads', 'N/A')}
-• Depth: {model_info.get('depth', 'N/A')}
 
 Training Summary:
 • Best Train Accuracy: {summary.get('best_train_accuracy', 0):.2f}%

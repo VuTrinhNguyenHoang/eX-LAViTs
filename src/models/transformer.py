@@ -40,27 +40,20 @@ class LinearMultiheadAttention(nn.Module):
         B, N, C = x.shape
         H, D = self.h, self.d
 
-        qkv = self.qkv(x)                              # [B, N, 3C]
-        qkv = qkv.view(B, N, 3, H, D).unbind(dim=2)    # 3 x [B, N, H, D]
-        q, k, v = (t.permute(0, 2, 1, 3).reshape(B*H, N, D) for t in qkv)  # [BH, N, D]
+        qkv = self.qkv(x).view(B, N, 3, H, D).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
 
-        qf = self._phi(q)                  # [BH,N,D]
-        kf = self._phi(k)                  # [BH,N,D]
+        qf = self._phi(q)
+        kf = self._phi(k)
         kf = self.attn_drop(kf)
 
-        # kv term: [BH,D,D]
-        kv = torch.bmm(kf.transpose(1, 2), v)
+        kv = torch.matmul(kf.transpose(-2, -1), v)      # [B,H,D,D]
+        z = kf.sum(dim=2)                               # [B,H,D]
+        y_num = torch.matmul(qf, kv)                    # [B,H,N,D]
+        y_den = torch.einsum("bhnd,bhd->bhn", qf, z)    # [B,H,N]
+        y_den = y_den.unsqueeze(-1).clamp_min(self.eps) # [B,H,N,1]
 
-        # numerator: [BH,N,D]
-        y_num = torch.bmm(qf, kv)
-
-        # denominator: [BH,N,1]
-        z = kf.sum(dim=2)                           # [BH,D]
-        y_den = (qf * z.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp_min(self.eps)
-
-        # output: [B,N,C]
-        y = (y_num / y_den)                             # [BH, N, D]
-        y = y.view(B, H, N, D).permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)
         y = self.proj_drop(self.out_proj(y))
         return y
     

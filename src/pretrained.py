@@ -153,6 +153,9 @@ def freeze_all_except_last_k_blocks(model: nn.Module, k: int = 4, logger=None):
     if not hasattr(model, 'blocks'):
         raise AttributeError("Model không có attribute 'blocks'.")
     
+    for p in model.parameters():
+        p.requires_grad = False
+
     for blk in model.blocks:
         if hasattr(blk, 'attn'):
             for p in blk.attn.parameters():
@@ -160,7 +163,8 @@ def freeze_all_except_last_k_blocks(model: nn.Module, k: int = 4, logger=None):
 
     n = len(model.blocks)
     for i, blk in enumerate(model.blocks):
-        set_requires_grad(blk, i >= n - k)
+        if i >= n - k:
+            set_requires_grad(blk, True)
 
     # giữ head và norm trainable
     for name in ['head', 'fc', 'norm']:

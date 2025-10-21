@@ -18,7 +18,7 @@ from src.utils.training import (
 )
 from src.utils.metrics import compute_loss_and_accuracy, compute_classification_metrics
 from src.utils.visualization import save_all_plots, create_training_summary_plot
-from src.models.linear_vit import create_linear_attention_vit
+from src.models.linear_vit import create_linear_attention_vit, LinearMultiheadAttention
 from datasets import get_dataset, DATASETS
 
 def load_config(config_path):
@@ -157,7 +157,7 @@ def freeze_all_except_last_k_blocks(model: nn.Module, k: int = 4, logger=None):
         p.requires_grad = False
 
     for blk in model.blocks:
-        if hasattr(blk, 'attn'):
+        if hasattr(blk, 'attn') and isinstance(blk.attn, LinearMultiheadAttention):
             for p in blk.attn.parameters():
                 p.requires_grad = True
 

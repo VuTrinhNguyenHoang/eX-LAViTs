@@ -152,18 +152,28 @@ def set_requires_grad(module: nn.Module, flag: bool):
 def freeze_all_except_last_k_blocks(model: nn.Module, k: int = 4, logger=None):
     if not hasattr(model, 'blocks'):
         raise AttributeError("Model không có attribute 'blocks'.")
+    
+    for blk in model.blocks:
+        if hasattr(blk, 'attn'):
+            for p in blk.attn.parameters():
+                p.requires_grad = True
+
     n = len(model.blocks)
     for i, blk in enumerate(model.blocks):
         set_requires_grad(blk, i >= n - k)
+
     # giữ head và norm trainable
     for name in ['head', 'fc', 'norm']:
         if hasattr(model, name):
             set_requires_grad(getattr(model, name), True)
+    
     # patch embed và pos_embed frozen
     if hasattr(model, 'patch_embed'):
         set_requires_grad(model.patch_embed, False)
+    
     if hasattr(model, 'pos_embed') and isinstance(model.pos_embed, torch.nn.Parameter):
         model.pos_embed.requires_grad = False
+
     if logger:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         logger.info(f"[Warmup] Trainable params with last {k} blocks: {trainable_params:,}")

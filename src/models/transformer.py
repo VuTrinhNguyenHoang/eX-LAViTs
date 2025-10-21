@@ -55,7 +55,7 @@ class LinearMultiheadAttention(nn.Module):
         y_num = torch.bmm(qf, kv)
 
         # denominator: [BH,N,1]
-        z = kv.sum(dim=1)                           # [BH,D]
+        z = kf.sum(dim=2)                           # [BH,D]
         y_den = (qf * z.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
         # output: [B,N,C]

@@ -38,34 +38,30 @@ class LinearMultiheadAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
-        qkv = (
-            self.qkv(x)
-            .reshape(B, N, 3, self.h, self.d)
-            .permute(2, 0, 3, 1, 4)
-        )
-        q, k, v = qkv[0], qkv[1], qkv[2]  # [B,H,N,D]
+        H, D = self.h, self.d
 
-        qf = self._phi(q)                  # [B,H,N,D]
-        kf = self._phi(k)                  # [B,H,N,D]
+        qkv = self.qkv(x)                              # [B, N, 3C]
+        qkv = qkv.view(B, N, 3, H, D).unbind(dim=2)    # 3 x [B, N, H, D]
+        q, k, v = (t.permute(0, 2, 1, 3).reshape(B*H, N, D) for t in qkv)  # [BH, N, D]
+
+        qf = self._phi(q)                  # [BH,N,D]
+        kf = self._phi(k)                  # [BH,N,D]
         kf = self.attn_drop(kf)
 
-        # kv term: [B,H,D,D]
-        kv = torch.matmul(kf.float().transpose(-1, -2), v.float())
-        kv = kv.to(v.dtype)
+        # kv term: [BH,D,D]
+        kv = torch.bmm(kf.transpose(1, 2), v)
 
-        # numerator: [B,H,N,D]
-        y_num = torch.matmul(qf, kv)
+        # numerator: [BH,N,D]
+        y_num = torch.bmm(qf, kv)
 
-        # denominator: [B,H,N,1]
-        z = kf.float().sum(dim=2)                          # [B,H,D]
-        y_den = torch.einsum("bhnd,bhd->bhn", qf, z.to(qf.dtype))  # [B,H,N]
-        y_den = y_den.unsqueeze(-1).clamp_min(self.eps)    # [B,H,N,1]
+        # denominator: [BH,N,1]
+        z = kv.sum(dim=1)                           # [BH,D]
+        y_den = (qf * z.unsqueeze(1)).sum(dim=-1, keepdim=True).clamp_min(self.eps)
 
         # output: [B,N,C]
-        y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)
-        y = self.out_proj(y)
-        y = self.proj_drop(y)
-
+        y = (y_num / y_den)                             # [BH, N, D]
+        y = y.view(B, H, N, D).permute(0, 2, 1, 3).contiguous().view(B, N, C)
+        y = self.proj_drop(self.out_proj(y))
         return y
     
 class LinearTransformerEncoderLayer(nn.Module):

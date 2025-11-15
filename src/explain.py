@@ -112,7 +112,7 @@ def visualize_explain(ds, idx, attr_model: nn.Module, use_pred=True, device="cud
     else:
         y_true = y
 
-    out = attr_model.attribute(x, y_true, return_all_layers=False)
+    out = attr_model.attribute(x, y_true)
     rtokens = out["rtokens"]
 
     heat_map = _tokens_to_heat(rtokens, attr_model.model, x.shape, has_cls=has_cls)  # [H,W]

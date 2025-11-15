@@ -63,7 +63,7 @@ class SHAP(nn.Module):
         Ms = []
         Ys = []
 
-        L = self.num_samples
+        L = self.samples
         for _ in range(L):
             m = torch.randint(0, 2, (B, N), device=device, dtype=torch.float32)
             s = m.sum(dim=1, keepdim=True)

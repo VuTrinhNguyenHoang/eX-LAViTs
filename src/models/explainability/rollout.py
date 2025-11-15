@@ -13,7 +13,7 @@ class LinearRollout(nn.Module):
         self.eps = eps
 
     @torch.no_grad()
-    def _attn_weights(self, blk, attn_in):
+    def _attn_weights_linear(self, blk, attn_in):
         attn = blk.attn
         B, N, C = attn_in.shape
         H = attn.h

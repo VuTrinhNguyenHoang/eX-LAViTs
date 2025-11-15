@@ -429,7 +429,7 @@ class AttributionMetrics:
 
         for i in range(1, steps+1):
             end = min(i * step, num_pixels)
-            idx = order[:, :end]  # [1, k]
+            idx = order[:, :end].unsqueeze(1)  # [1, k]
             # cập nhật mask: 0 cho pixel đã xóa
             mask.scatter_(2, idx, 0.0)
 
@@ -486,7 +486,7 @@ class AttributionMetrics:
 
         for i in range(1, steps+1):
             end = min(i * step, num_pixels)
-            idx = order[:, :end]  # [1, k]
+            idx = order[:, :end].unsqueeze(1)  # [1, k]
             # các pixel này được copy từ x sang
             mask.scatter_(2, idx, 1.0)
 

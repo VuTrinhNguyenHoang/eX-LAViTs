@@ -1,9 +1,11 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from sklearn.metrics import classification_report, confusion_matrix
 from typing import Dict, Any, Optional, Tuple
 import psutil
-import os
+import os, math
 
 class AverageMeter:
     """Computes and stores the average and current value."""
@@ -285,3 +287,469 @@ def get_memory_usage() -> float:
             return torch.cuda.memory_allocated() / 1024 / 1024  # GPU memory in MB
         else:
             return 0.0  # Unable to get memory info
+
+def tokens_to_heat(
+    rtokens: torch.Tensor,
+    model,
+    x_shape,
+    has_cls: bool = True
+):
+    B, C_in, H, W = x_shape
+    assert B == rtokens.size(0)
+    r = rtokens  # [B,N]
+
+    # bỏ CLS nếu có
+    if has_cls:
+        r_patch = r[:, 1:]     # [B, Np]
+    else:
+        r_patch = r
+
+    Np = r_patch.size(1)
+
+    if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "grid_size"):
+        gh, gw = model.patch_embed.grid_size
+    else:
+        # fallback: suy từ stride/patch size
+        if hasattr(model, "patch_embed") and hasattr(model.patch_embed, "proj"):
+            S = model.patch_embed.proj.stride[0]
+        else:
+            raise RuntimeError("Không tìm được grid_size/stride từ model.")
+        gh = H // S
+        gw = W // S
+
+    assert gh * gw == Np, f"grid_size ({gh},{gw}) không khớp với số patch {Np}"
+
+    r_grid = r_patch.view(B, 1, gh, gw)  # [B,1,gh,gw]
+    heat = F.interpolate(r_grid, size=(H, W), mode="bilinear", align_corners=False)  # [B,1,H,W]
+    return heat[:, 0]  # [B,H,W]
+
+def extract_heat_from_attr_output(
+    attr_out: Dict[str, torch.Tensor],
+    attr_model,
+    x: torch.Tensor,
+    has_cls: bool = True
+):
+    rtokens = attr_out["rtokens"]
+    model = getattr(attr_model, "model", None)
+    if model is None:
+        raise RuntimeError("Không tìm thấy attr_model.model để map rtokens -> heat.")
+    return tokens_to_heat(rtokens, model, x.shape, has_cls=has_cls)
+
+class AttributionMetrics:
+    def __init__(self, model: nn.Module, device: str = "cuda", eps: float = 1e-6):
+        self.model = model.to(device)
+        self.device = device
+        self.eps = eps
+
+    # ------------- utils -------------
+    def _prepare(self, x: torch.Tensor, heat: torch.Tensor
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if x.dim() == 3:   # [3,H,W]
+            x = x.unsqueeze(0)
+        if heat.dim() == 2:  # [H,W]
+            heat = heat.unsqueeze(0)
+        assert x.dim() == 4 and heat.dim() == 3
+        assert x.size(0) == heat.size(0)
+        H, W = x.shape[-2:]
+        assert heat.shape[-2:] == (H, W)
+        x = x.to(self.device)
+        heat = heat.to(self.device)
+        return x, heat
+
+    def _normalize_heat(self, heat: torch.Tensor) -> torch.Tensor:
+        h = heat.clamp_min(0)
+        s = h.flatten(1).sum(dim=1, keepdim=True) + self.eps
+        h = h / s.view(-1, 1, 1)
+        return h
+
+    def _baseline(self, x: torch.Tensor, mode: str = "blur") -> torch.Tensor:
+        if mode == "zeros":
+            return torch.zeros_like(x)
+        elif mode == "mean":
+            m = x.mean(dim=(2,3), keepdim=True)
+            return m.expand_as(x)
+        elif mode == "blur":
+            k = 11
+            pad = k // 2
+            return F.avg_pool2d(x, kernel_size=k, stride=1, padding=pad)
+        else:
+            raise ValueError(f"Unknown baseline mode: {mode}")
+
+    def _auc_trapezoid(self, xs: torch.Tensor, ys: torch.Tensor) -> float:
+        xs = xs.view(-1)
+        ys = ys.view(-1)
+        dx = xs[1:] - xs[:-1]
+        avg_y = 0.5 * (ys[1:] + ys[:-1])
+        auc = (dx * avg_y).sum().item()
+        return float(auc)
+
+    # ------------- AUC Deletion & Insertion -------------
+    @torch.no_grad()
+    def auc_deletion(
+        self,
+        x: torch.Tensor,
+        y_true: torch.Tensor,
+        heat: torch.Tensor,
+        steps: int = 20,
+        baseline_mode: str = "mean",
+    ) -> float:
+        """
+        AUC_deletion:
+          - Bắt đầu từ ảnh gốc.
+          - Lần lượt "xóa" (mask) các pixel từ cao -> thấp theo heatmap.
+          - Theo dõi xác suất dự đoán class y_true.
+          - AUC (cao -> ít sụt nhanh; thấp -> sụt nhanh, method tốt).
+        """
+        self.model.eval()
+        x, heat = self._prepare(x, heat)   # [1,3,H,W], [1,H,W]
+        y_true = y_true.view(-1).to(self.device)
+        B, _, H, W = x.shape
+        assert B == 1, "Hiện tại chỉ hỗ trợ batch=1 cho AUC_del/ins."
+
+        # chuẩn hóa heat để xếp thứ tự
+        h = heat.view(1, -1)  # [1, H*W]
+        order = torch.argsort(h, dim=1, descending=True)  # [1, H*W]
+
+        x_cur = x.clone()
+        base = self._baseline(x, mode=baseline_mode)
+
+        # mask ban đầu: all ones (không xóa)
+        mask = torch.ones(1, 1, H*W, device=self.device)
+        probs = []
+
+        # bước = số phần tử xóa mỗi step
+        num_pixels = H * W
+        step = max(1, num_pixels // steps)
+
+        # t=0: ảnh gốc
+        with torch.no_grad():
+            logits = self.model(x_cur)
+            prob = logits.softmax(dim=1).gather(1, y_true[:, None]).squeeze(1)
+        probs.append(prob.item())
+
+        for i in range(1, steps+1):
+            end = min(i * step, num_pixels)
+            idx = order[:, :end]  # [1, k]
+            # cập nhật mask: 0 cho pixel đã xóa
+            mask.scatter_(2, idx, 0.0)
+
+            mask_2d = mask.view(1, 1, H, W)
+            x_cur = x * mask_2d + base * (1 - mask_2d)
+
+            logits = self.model(x_cur)
+            prob = logits.softmax(dim=1).gather(1, y_true[:, None]).squeeze(1)
+            probs.append(prob.item())
+
+        xs = torch.linspace(0, 1, steps+1, device=self.device)  # tỉ lệ pixel đã xóa
+        ys = torch.tensor(probs, device=self.device)
+        auc = self._auc_trapezoid(xs, ys)
+        return auc
+
+    @torch.no_grad()
+    def auc_insertion(
+        self,
+        x: torch.Tensor,
+        y_true: torch.Tensor,
+        heat: torch.Tensor,
+        steps: int = 20,
+        baseline_mode: str = "zeros",
+    ) -> float:
+        """
+        AUC_insertion:
+          - Bắt đầu từ baseline (ví dụ ảnh 0 hoặc blur).
+          - Lần lượt "chèn" các pixel quan trọng nhất từ heatmap.
+          - AUC (cao -> tăng nhanh về xác suất, method tốt).
+        """
+        self.model.eval()
+        x, heat = self._prepare(x, heat)   # [1,3,H,W], [1,H,W]
+        y_true = y_true.view(-1).to(self.device)
+        B, _, H, W = x.shape
+        assert B == 1
+
+        h = heat.view(1, -1)                           # [1, H*W]
+        order = torch.argsort(h, dim=1, descending=True)  # [1, H*W]
+
+        base = self._baseline(x, mode=baseline_mode)
+        x_cur = base.clone()
+
+        # mask ban đầu: all zeros (chưa chèn)
+        mask = torch.zeros(1, 1, H*W, device=self.device)
+        probs = []
+
+        num_pixels = H * W
+        step = max(1, num_pixels // steps)
+
+        # t=0: baseline
+        logits = self.model(x_cur)
+        prob = logits.softmax(dim=1).gather(1, y_true[:, None]).squeeze(1)
+        probs.append(prob.item())
+
+        for i in range(1, steps+1):
+            end = min(i * step, num_pixels)
+            idx = order[:, :end]  # [1, k]
+            # các pixel này được copy từ x sang
+            mask.scatter_(2, idx, 1.0)
+
+            mask_2d = mask.view(1, 1, H, W)
+            x_cur = x * mask_2d + base * (1 - mask_2d)
+
+            logits = self.model(x_cur)
+            prob = logits.softmax(dim=1).gather(1, y_true[:, None]).squeeze(1)
+            probs.append(prob.item())
+
+        xs = torch.linspace(0, 1, steps+1, device=self.device)  # tỉ lệ pixel đã chèn
+        ys = torch.tensor(probs, device=self.device)
+        auc = self._auc_trapezoid(xs, ys)
+        return auc
+
+    # ------------- Entropy & Gini -------------
+    def entropy(
+        self,
+        heat: torch.Tensor,
+        normalize: bool = True,
+    ) -> torch.Tensor:
+        """
+        Entropy của phân bố relevance.
+        heat: [B,H,W] hoặc [H,W] hoặc [B,N].
+        Trả về: [B] tensor.
+        """
+        if heat.dim() == 2:      # [H,W] -> [1,H,W]
+            heat = heat.unsqueeze(0)
+        if heat.dim() == 3:      # [B,H,W] -> [B,HW]
+            h = heat.flatten(1)
+        elif heat.dim() == 2:    # [B,N]
+            h = heat
+        else:
+            raise ValueError("heat shape không hỗ trợ")
+
+        h = h.clamp_min(0)
+        s = h.sum(dim=1, keepdim=True) + self.eps
+        p = h / s
+
+        ent = -(p * (p + self.eps).log()).sum(dim=1)  # [B]
+
+        if normalize:
+            K = p.size(1)
+            ent = ent / (torch.log(torch.tensor(K, dtype=ent.dtype, device=ent.device)) + self.eps)
+        return ent  # [B], trong [0,1] nếu normalize
+
+    def gini_index(
+        self,
+        heat: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Gini index (dạng 'concentration'):
+           G = sum_i p_i^2  (cao khi tập trung vào ít vùng, thấp khi phân tán).
+        Nếu bạn muốn Gini impurity: 1 - G.
+        """
+        if heat.dim() == 2:
+            heat = heat.unsqueeze(0)
+        if heat.dim() == 3:
+            h = heat.flatten(1)
+        elif heat.dim() == 2:
+            h = heat
+        else:
+            raise ValueError("heat shape không hỗ trợ")
+
+        h = h.clamp_min(0)
+        s = h.sum(dim=1, keepdim=True) + self.eps
+        p = h / s
+        g = (p ** 2).sum(dim=1)   # [B], 1/K <= g <= 1
+        return g
+
+    # ------------- Cross-class similarity -------------
+    def cross_class_similarity(
+        self,
+        heat_multi: torch.Tensor,
+        mode: str = "pairwise_mean",
+    ) -> torch.Tensor:
+        """
+        Đo độ giống nhau giữa heatmap các class khác nhau cho cùng 1 ảnh.
+        heat_multi: [C, H, W] hoặc [C, N] (C: số class giải thích).
+        mode:
+          - "pairwise_mean": mean cosine similarity của tất cả cặp (c1,c2), c1<c2.
+          - "one_vs_rest": cosine giữa class 0 và các class còn lại, rồi lấy mean.
+        Trả về: scalar tensor.
+        """
+        if heat_multi.dim() == 3:    # [C,H,W] -> [C,N]
+            C, H, W = heat_multi.shape
+            Hf = heat_multi.view(C, -1)
+        elif heat_multi.dim() == 2:  # [C,N]
+            Hf = heat_multi
+            C = Hf.size(0)
+        else:
+            raise ValueError("heat_multi phải có shape [C,H,W] hoặc [C,N].")
+
+        # chuẩn hóa dương + L2
+        Hf = Hf.clamp_min(0)
+        s = Hf.sum(dim=1, keepdim=True) + self.eps
+        Hf = Hf / s
+
+        # L2-normalize
+        Hf = Hf / (Hf.norm(dim=1, keepdim=True) + self.eps)  # [C,N]
+
+        if mode == "pairwise_mean":
+            sims = []
+            for i in range(C):
+                for j in range(i+1, C):
+                    sim = (Hf[i] * Hf[j]).sum()   # cosine
+                    sims.append(sim)
+            if len(sims) == 0:
+                return torch.tensor(1.0, dtype=Hf.dtype, device=Hf.device)
+            return torch.stack(sims).mean()
+        elif mode == "one_vs_rest":
+            base = Hf[0]    # class 0 vs others
+            sims = []
+            for j in range(1, C):
+                sim = (base * Hf[j]).sum()
+                sims.append(sim)
+            if len(sims) == 0:
+                return torch.tensor(1.0, dtype=Hf.dtype, device=Hf.device)
+            return torch.stack(sims).mean()
+        else:
+            raise ValueError(f"Unknown mode {mode}")
+
+def _get_item(sample):
+        img, y = None, None
+        if isinstance(sample, (tuple, list)):
+            img = sample[0]
+            if len(sample) > 1:
+                y = sample[1]
+        elif isinstance(sample, dict):
+            for k in ("image", "img", "tensor", "x"):
+                if k in sample:
+                    img = sample[k]; break
+            for k in ("label", "y", "target"):
+                if k in sample:
+                    y = sample[k]; break
+        else:
+            img = sample
+        if not torch.is_tensor(img):
+            raise TypeError("Dataset phải trả về ảnh dạng torch.Tensor.")
+        if y is not None and not torch.is_tensor(y):
+            y = torch.tensor(y)
+        return img, y
+
+def _mean(xs):
+    if len(xs) == 0:
+        return float("nan")
+    return float(sum(xs) / len(xs))
+
+def evaluate_method_on_loader(
+    attr_model,
+    backbone_model,
+    dataloader,
+    device: str = "cuda",
+    has_cls: bool = True,
+    steps: int = 20,
+    max_batches: int = None
+):
+    metric = AttributionMetrics(backbone_model, device=device)
+    attr_model.model.to(device)
+    backbone_model.to(device)
+    backbone_model.eval()
+
+    auc_del_list = []
+    auc_ins_list = []
+    ent_list = []
+    gini_list = []
+
+    for bi, batch in enumerate(dataloader):
+        if max_batches is not None and bi >= max_batches:
+            break
+
+        x, y = _get_item(batch)     # x: [B,3,H,W] hoặc [3,H,W]
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        
+        if y is None:
+            # nếu không có label GT, dùng predicted class
+            with torch.no_grad():
+                logits = backbone_model(x.to(device))
+                y = logits.argmax(dim=1).cpu()
+        else:
+            y = y.view(-1)
+
+        x = x.to(device)
+        y = y.to(device)
+
+        B = x.size(0)
+        for i in range(B):
+            xi = x[i:i+1]
+            yi = y[i:i+1]
+
+            attr_out = attr_model.attribute(xi, yi)
+            heat = extract_heat_from_attr_output(attr_out, attr_model, xi, has_cls=has_cls)  # [1,H,W]
+            heat_i = heat[0]
+
+            auc_del = metric.auc_deletion(xi[0], yi[0], heat_i, steps=steps, baseline_mode="mean")
+            auc_ins = metric.auc_insertion(xi[0], yi[0], heat_i, steps=steps, baseline_mode="zeros")
+
+            ent = metric.entropy(heat_i, normalize=True)[0].item()
+            gini = metric.gini_index(heat_i)[0].item()
+
+            auc_del_list.append(auc_del)
+            auc_ins_list.append(auc_ins)
+            ent_list.append(ent)
+            gini_list.append(gini)
+
+    return {
+        "auc_del_mean": _mean(auc_del_list),
+        "auc_ins_mean": _mean(auc_ins_list),
+        "entropy_mean": _mean(ent_list),
+        "gini_mean": _mean(gini_list),
+        "n_samples": len(auc_del_list),
+    }
+
+@torch.no_grad()
+def evaluate_cross_class_similarity(
+    attr_model,
+    backbone_model,
+    dataloader,
+    device: str = "cuda",
+    has_cls: bool = True,
+    max_batches: int = None
+):
+    metric = AttributionMetrics(backbone_model, device=device)
+    attr_model.model.to(device)
+    backbone_model.to(device)
+    backbone_model.eval()
+
+    sims = []
+
+    for bi, batch in enumerate(dataloader):
+        if max_batches is not None and bi >= max_batches:
+            break
+
+        x, _ = _get_item(batch)
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        x = x.to(device)
+
+        B = x.size(0)
+        for i in range(B):
+            xi = x[i:i+1]   # [1,3,H,W]
+
+            # top-2 class
+            logits = backbone_model(xi)
+            top2 = logits[0].topk(2).indices    # [2]
+            classes = top2.to(device)
+
+            heats = []
+            for c in classes:
+                yi = c.view(1)
+                attr_out = attr_model.attribute(xi, yi)
+                heat = extract_heat_from_attr_output(attr_out, attr_model, xi, has_cls=has_cls)  # [1,H,W]
+                heats.append(heat[0])
+
+            if len(heats) < 2:
+                continue
+
+            heat_multi = torch.stack(heats, dim=0)  # [2,H,W]
+            sim = metric.cross_class_similarity(heat_multi, mode="pairwise_mean")
+            sims.append(sim.item())
+
+    if len(sims) == 0:
+        return {"ccs_mean": float("nan"), "n_samples": 0}
+    return {"ccs_mean": float(sum(sims)/len(sims)), "n_samples": len(sims)}
+

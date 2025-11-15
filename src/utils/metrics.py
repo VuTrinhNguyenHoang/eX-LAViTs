@@ -6,6 +6,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 from typing import Dict, Any, Optional, Tuple
 import psutil
 import os, math
+from tqdm.auto import tqdm
 
 class AverageMeter:
     """Computes and stores the average and current value."""
@@ -654,7 +655,7 @@ def evaluate_method_on_loader(
     ent_list = []
     gini_list = []
 
-    for bi, batch in enumerate(dataloader):
+    for bi, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Evaluating..."):
         if max_batches is not None and bi >= max_batches:
             break
 
@@ -701,7 +702,6 @@ def evaluate_method_on_loader(
         "n_samples": len(auc_del_list),
     }
 
-@torch.no_grad()
 def evaluate_cross_class_similarity(
     attr_model,
     backbone_model,
@@ -717,7 +717,7 @@ def evaluate_cross_class_similarity(
 
     sims = []
 
-    for bi, batch in enumerate(dataloader):
+    for bi, batch in tqdm(enumerate(dataloader), total=len(dataloader), desc=f"Evaluating..."):
         if max_batches is not None and bi >= max_batches:
             break
 

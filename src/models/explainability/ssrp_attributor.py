@@ -6,7 +6,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class SSRP(nn.Module):
-    def __init__(self, model: nn.Module, r_modes: int = 8, lam: float = 0.3, use_shap: bool = True, shap_samples: int = 32, eps: float = 1e-6):
+    def __init__(self, model: nn.Module, r_modes: int = 8, lam: float = 0.3, use_shap: bool = True, shap_samples: int = 32, eps: float = 1e-6,
+                 k_modes: int = 3, token_p: float = 1.5):
         super().__init__()
         self.model = model
         self.r = r_modes
@@ -15,6 +16,9 @@ class SSRP(nn.Module):
         self.shap_samples = shap_samples
         self.eps = eps
         self.grid_hw = getattr(self.model.patch_embed, "grid_size", None)
+
+        self.k_modes = k_modes
+        self.token_p = token_p
 
         # backbone structure
         self.blocks: List[nn.Module] = list(getattr(self.model, "blocks"))
@@ -198,6 +202,14 @@ class SSRP(nn.Module):
         # scores theo mode
         g_mode = S * (z * Pi).sum(dim=2)                        # [B,H,r]
         w_mode = (g_mode.abs() + self.eps)
+
+        k = min(self.k_modes, w_mode.size(-1))
+        if k > 0 and k < w_mode.size(-1):
+            _, idx = w_mode.topk(k, dim=-1, largest=True, sorted=False)
+            mask = torch.zeros_like(w_mode)
+            mask.scatter_(-1, idx, 1.0)
+            w_mode = w_mode * mask
+
         w_mode = w_mode / (w_mode.sum(dim=-1, keepdim=True) + self.eps)      # [B,H,r]
         R_spec = R_head.unsqueeze(-1) * w_mode                                  # [B,H,r]
 
@@ -220,6 +232,11 @@ class SSRP(nn.Module):
         R_tokens = ((1 - self.lam) * R_tokens_LRP + self.lam * R_tokens_SHAP).sum(dim=1)  # [B,N]
         R_tokens = R_tokens.clamp_min(0)
         # conservation: \sum_n R_tokens = \sum_h R_head = mass_attn
+
+        if self.token_p != 1.0:
+            mass = R_tokens.sum(dim=1, keepdim=True)  # [B,1]
+            R_tokens = R_tokens ** self.token_p
+            R_tokens = R_tokens / (R_tokens.sum(dim=1, keepdim=True) + self.eps) * mass
 
         # tuỳ chọn làm mượt token spatial một chút (nhưng vẫn ở token-level)
         if self.grid_hw is not None:

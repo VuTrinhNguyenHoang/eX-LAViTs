@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch
 
 class LARP(nn.Module):
-    def __init__(self, model, has_cls: bool = True, eps: float = 1e-6, head_agg: str = "mean"):
+    def __init__(self, model, has_cls: bool = True, eps: float = 1e-6, head_agg: str = "mean", attn_temp: float = 0.7, token_p: float = 1.5):
         super().__init__()
         self.model = model
         self.blocks: List[nn.Module] = list(getattr(self.model, "blocks"))
@@ -12,6 +12,9 @@ class LARP(nn.Module):
         self.eps = eps
         assert head_agg in ("mean", "sum")
         self.head_agg = head_agg
+
+        self.attn_temp = attn_temp
+        self.token_p   = token_p
 
         self._f_hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.cache: List[Dict[str, torch.Tensor]] = []
@@ -95,9 +98,12 @@ class LARP(nn.Module):
 
         # s_{t,j} = <phi(q_t), phi(k_j)>
         # s: [B, H, N, N] với chỉ số (b,h,t,j)
-        s = torch.einsum("bhnd,bhmd->bhnm", qf, kf)  # t = n, j = m
-
+        s = torch.einsum("bhnd,bhmd->bhnm", qf, kf)  # [B,H,N,N]
         s = self._pos(s) + self.eps
+
+        if self.attn_temp != 1.0:
+            s = s ** (1.0 / self.attn_temp)
+
         w = s / (s.sum(dim=-1, keepdim=True) + self.eps)  # normalize theo j
         return w  # [B, H, N, N]
 
@@ -209,6 +215,12 @@ class LARP(nn.Module):
             # đảo ngược lại cho dễ đọc: [input, ..., output]
             R_layers = R_layers[::-1]
             out["rtokens_layers"] = torch.stack(R_layers, dim=0)  # [L+1, B, N]
+
+        R_tokens = R_tokens.clamp_min(0.)
+        if self.token_p != 1.0:
+            mass = R_tokens.sum(dim=1, keepdim=True) + self.eps
+            R_tokens = (R_tokens ** self.token_p)
+            R_tokens = R_tokens / (R_tokens.sum(dim=1, keepdim=True) + self.eps) * mass
 
         self._clear()
         return out

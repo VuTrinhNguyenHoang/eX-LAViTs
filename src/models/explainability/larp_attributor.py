@@ -300,20 +300,20 @@ class LARP(nn.Module):
           }
         """
         self.model.eval()
-        torch.set_grad_enabled(True)
         for p in self.model.parameters():
             p.requires_grad_(True)
 
         self._register()
 
         # ---------- forward ----------
-        logits = self.model(x)                            # [B,K]
-        B, K = logits.shape
+        with torch.enable_grad():
+            logits = self.model(x)                            # [B,K]
+            B, K = logits.shape
 
-        # ---------- backward để lấy grad ----------
-        self.model.zero_grad(set_to_none=True)
-        tgt_score = logits.gather(1, y_true[:, None]).sum()
-        tgt_score.backward(retain_graph=True)
+            # ---------- backward để lấy grad ----------
+            self.model.zero_grad(set_to_none=True)
+            tgt_score = logits.gather(1, y_true[:, None]).sum()
+            tgt_score.backward(retain_graph=True)
 
         # ---------- init relevance ở head ----------
         X_L = self.cache[-1]["x_out"]                     # [B,N_L,C]
@@ -393,5 +393,4 @@ class LARP(nn.Module):
             out["rtokens_layers"] = torch.stack(R_layers_tokens, dim=0).detach()
 
         self._clear()
-        torch.set_grad_enabled(False)
         return out

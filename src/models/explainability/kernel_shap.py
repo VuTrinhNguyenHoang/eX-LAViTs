@@ -68,7 +68,7 @@ class KernelSHAP(nn.Module):
             Ys.append(y_m)
 
         M = torch.stack(Ms, dim=0)          # [L,Np]
-        Y = torch.stack(Ys, dim=0)          # [L]
+        Y = torch.stack(Ys, dim=0).view(-1)          # [L]
 
         s_frac = M.mean(dim=1, keepdim=True).clamp_(1e-6, 1-1e-6)
         w = (Np - 1) / (s_frac * (1 - s_frac))      # [L,1]

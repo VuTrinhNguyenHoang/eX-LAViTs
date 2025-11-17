@@ -102,5 +102,9 @@ class Rollout(nn.Module):
             Hn, Wn = H // self.stride, W // self.stride
 
         cam_map = cam_tokens.view(B, 1, Hn, Wn)
+        rtokens  = cam_map[:, 0]
         cam_up = F.interpolate(cam_map, size=(H,W), mode='bilinear', align_corners=False)[:,0]
-        return {"rtokens_up": cam_up.detach()}
+        return {
+            "rtokens":    rtokens.detach(),
+            "rtokens_up": cam_up.detach()
+        }

@@ -65,5 +65,9 @@ class Occlusion(nn.Module):
             s_pos = s_pos / s_pos.max()
 
         cam = s_pos.view(1,1,Hn,Wn)
+        rtokens = cam[:,0]                       # [1,Hn,Wn]
         cam_up = F.interpolate(cam, size=(H,W), mode='bilinear', align_corners=False)[:,0]
-        return {"rtokens_up": cam_up.detach()}
+        return {
+            "rtokens":    rtokens.detach(),
+            "rtokens_up": cam_up.detach()
+        }

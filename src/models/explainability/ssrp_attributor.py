@@ -382,14 +382,17 @@ class SSRP(nn.Module):
 
         # tokens tại input block 0
         R_tokensC0 = R_x2
-        Rpix = self._tokens_to_pixels(R_tokensC0, x)             # [B,3,H,W]
 
         # upsample token map (không bắt buộc)
         R_tokens = R_tokensC0.sum(dim=-1)                        # [B,N]
         Hn, Wn = x.shape[-2] // self.stride, x.shape[-1] // self.stride
         R_map = R_tokens[:, 1:] if self.has_cls else R_tokens
         R_map = R_map.view(x.size(0), 1, Hn, Wn)
+        rtokens = R_map[:, 0]
         R_up  = F.interpolate(R_map, size=x.shape[-2:], mode='bilinear', align_corners=False)[:, 0]
 
         self._clear()
-        return {"rpix": Rpix.detach(), "rtokens_up": R_up.detach()}
+        return {
+            "rtokens":     rtokens.detach(), # token-level cho metrics
+            "rtokens_up":  R_up.detach()     # để overlay
+        }

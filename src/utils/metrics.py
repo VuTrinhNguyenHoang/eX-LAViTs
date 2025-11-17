@@ -289,80 +289,51 @@ def get_memory_usage() -> float:
         else:
             return 0.0  # Unable to get memory info
 
-def normalize_heatmap(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    if h.dim() == 3:
-        # nếu có kênh, tổng theo kênh
-        if h.size(0) > 1:
-            h = h.sum(dim=0)
-        else:
-            h = h.squeeze(0)
-    h = h.clamp_min(0)
-    s = h.sum()
-    if s <= eps:
-        # nếu toàn 0, trả phân bố đều
-        H, W = h.shape
-        return torch.full_like(h, 1.0 / (H * W))
-    return h / s
+def to_token_heatmap(
+    heat_hw: torch.Tensor,        # [H,W] hoặc [1,H,W]
+    backbone: torch.nn.Module,
+    eps: float = 1e-8
+) -> torch.Tensor:
+    """
+    Chuyển heatmap pixel H×W về heatmap theo patch/token Hn×Wn
+    bằng average pooling theo stride patch_embed.
 
-def heatmap_entropy(h: torch.Tensor, eps: float = 1e-8) -> float:
+    Trả về: [Hn, Wn]
     """
-    Entropy chuẩn hoá về [0,1].
-    h: [H,W] hoặc [C,H,W] (sẽ normalize trước).
-    """
-    p = normalize_heatmap(h, eps)
-    N = p.numel()
-    ent = -(p * (p + eps).log()).sum()
-    ent = ent.item()
-    ent_norm = ent / math.log(N + eps)
-    return float(ent_norm)
+    if heat_hw.dim() == 3:
+        heat_hw = heat_hw.squeeze(0)
+    H, W = heat_hw.shape
 
-def heatmap_gini(h: torch.Tensor, eps: float = 1e-8) -> float:
-    """
-    Hệ số Gini của phân bố heatmap (0: đều, 1: cực kỳ tập trung).
-    h: [H,W] hoặc [C,H,W].
-    """
-    p = normalize_heatmap(h, eps).view(-1)
-    if p.numel() == 0:
-        return 0.0
-    # sort tăng dần
-    p_sorted, _ = torch.sort(p)
-    N = p_sorted.numel()
-    index = torch.arange(1, N + 1, device=p_sorted.device, dtype=p_sorted.dtype)
-    num = (2 * index * p_sorted).sum()
-    den = N * p_sorted.sum() + eps
-    gini = (num / den - (N + 1) / N).item()
-    return float(gini)
+    pe = backbone.patch_embed.proj
+    S = pe.stride[0]
+    assert H % S == 0 and W % S == 0, "H,W phải chia hết cho stride patch."
+
+    h = heat_hw.unsqueeze(0).unsqueeze(0)         # [1,1,H,W]
+    h_tok = F.avg_pool2d(h, kernel_size=S, stride=S)  # [1,1,Hn,Wn]
+    h_tok = h_tok[0, 0]                           # [Hn,Wn]
+
+    h_tok = h_tok.clamp_min(0)
+    if h_tok.sum() <= eps:
+        Hn, Wn = h_tok.shape
+        return torch.full_like(h_tok, 1.0 / (Hn * Wn))
+    return h_tok
 
 @torch.no_grad()
-def _perturb_image(x: torch.Tensor,
-                   baseline: torch.Tensor,
-                   mask: torch.Tensor,
-                   mode: str) -> torch.Tensor:
-    """
-    x, baseline: [1,3,H,W]
-    mask: [1,1,H,W] với giá trị 0/1
-    mode: 'deletion' hoặc 'insertion'
-    """
-    if mode == "deletion":
-        return mask * x + (1 - mask) * baseline
-    elif mode == "insertion":
-        return (1 - mask) * baseline + mask * x
-    else:
-        raise ValueError("mode phải là 'deletion' hoặc 'insertion'")
-    
-@torch.no_grad()
-def deletion_insertion_auc(
+def deletion_insertion_auc_tokens(
     model: torch.nn.Module,
     x: torch.Tensor,              # [1,3,H,W]
     y_true: torch.Tensor,         # [1]
-    heatmap: torch.Tensor,        # [H,W] hoặc [C,H,W]
+    heat_tok: torch.Tensor,       # [Hn,Wn] token-level
     steps: int = 50,
     baseline: Optional[torch.Tensor] = None,
     device: Optional[str] = None,
 ) -> Dict[str, float]:
     """
-    Tính AUC–Deletion và AUC–Insertion cho MỘT ảnh.
-    Score = softmax prob của lớp y_true -> đảm bảo AUC ∈ [0,1].
+    AUC Deletion/Insertion patch-level:
+      - heat_tok: relevance trên grid Hn×Wn (mỗi cell = 1 patch).
+      - mask thao tác theo patch, rồi upsample mask lên H×W.
+
+    Score = softmax prob(y_true) -> AUC ∈ [0,1].
     """
     assert x.size(0) == 1, "Hàm này hiện thiết kế cho batch=1."
     if device is not None:
@@ -377,63 +348,56 @@ def deletion_insertion_auc(
     if baseline is None:
         baseline = torch.zeros_like(x)
 
-    # dùng positive heatmap, flatten
-    if heatmap.dim() == 3 and heatmap.size(0) > 1:
-        h = heatmap.sum(dim=0)
-    else:
-        h = heatmap.squeeze(0) if heatmap.dim() == 3 else heatmap
-    h = h.clamp_min(0)
-    flat = h.view(-1)
-    N = flat.numel()
-    if steps > N:
-        steps = N
+    Hn, Wn = heat_tok.shape
+    flat = heat_tok.view(-1).clamp_min(0)    # [Np]
+    Np = flat.numel()
+    if steps > Np:
+        steps = Np
+    k = max(1, Np // steps)
 
-    order = torch.argsort(flat, descending=True)  # index pixel theo importance
-    k = max(1, N // steps)                        # số pixel mỗi bước
+    order = torch.argsort(flat, descending=True)
 
-    def _scores_along_path(mode: str) -> np.ndarray:
+    def _scores_path(mode: str) -> np.ndarray:
         scores = []
         if mode == "deletion":
-            mask_flat = torch.ones(N, device=device)
-        else:  # insertion
-            mask_flat = torch.zeros(N, device=device)
+            mask_tok_flat = torch.ones(Np, device=device)
+        else:
+            mask_tok_flat = torch.zeros(Np, device=device)
 
         for s in range(steps + 1):
-            mask = mask_flat.view(1, 1, H, W)
-            x_pert = _perturb_image(x, baseline, mask, mode)
+            mask_tok = mask_tok_flat.view(1, 1, Hn, Wn)        # [1,1,Hn,Wn]
+            mask_px = F.interpolate(mask_tok, size=(H, W), mode="nearest")
+            x_pert = mask_px * x + (1 - mask_px) * baseline    # [1,3,H,W]
+
             logits = model(x_pert)
             probs = torch.softmax(logits, dim=1)
-            score = probs.gather(1, y_true[:, None]).squeeze(1)  # [1]
+            score = probs.gather(1, y_true[:, None]).squeeze(1)
             scores.append(score.item())
 
             if s == steps:
                 break
 
             start = s * k
-            end = (s + 1) * k if s < steps - 1 else N
+            end = (s + 1) * k if s < steps - 1 else Np
             idx = order[start:end]
             if mode == "deletion":
-                mask_flat[idx] = 0.0
+                mask_tok_flat[idx] = 0.0
             else:
-                mask_flat[idx] = 1.0
+                mask_tok_flat[idx] = 1.0
 
         return np.array(scores, dtype=np.float64)
 
-    # Deletion & insertion (probabilities ∈ [0,1])
-    scores_del = _scores_along_path("deletion")   # từ full-ảnh -> baseline
-    scores_ins = _scores_along_path("insertion")  # từ baseline -> full-ảnh
+    scores_del = _scores_path("deletion")
+    scores_ins = _scores_path("insertion")
 
-    p_full = scores_del[0]        # prob tại ảnh gốc
-    p_base = scores_ins[0]        # prob tại baseline (thường ~0)
+    p_full = scores_del[0]
+    p_base = scores_ins[0]
 
-    # chuẩn hoá về [0,1] và clamp để tránh overshoot / numeric noise
-    # Deletion: 1 tại full ảnh, ~0 tại baseline
     if p_full < 1e-8:
         scores_del_norm = np.zeros_like(scores_del)
     else:
         scores_del_norm = np.clip(scores_del / (p_full + 1e-8), 0.0, 1.0)
 
-    # Insertion: 0 tại baseline, 1 tại full ảnh
     denom = p_full - p_base
     if abs(denom) < 1e-8:
         scores_ins_norm = np.zeros_like(scores_ins)
@@ -446,19 +410,45 @@ def deletion_insertion_auc(
 
     return {"auc_del": auc_del, "auc_ins": auc_ins}
 
+def normalize_heatmap(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    # h: [Hn,Wn]
+    if h.dim() == 3:
+        if h.size(0) > 1:
+            h = h.sum(dim=0)
+        else:
+            h = h.squeeze(0)
+    h = h.clamp_min(0)
+    s = h.sum()
+    if s <= eps:
+        H, W = h.shape
+        return torch.full_like(h, 1.0 / (H * W))
+    return h / s
+
+def heatmap_entropy(h: torch.Tensor, eps: float = 1e-8) -> float:
+    p = normalize_heatmap(h, eps)
+    N = p.numel()
+    ent = -(p * (p + eps).log()).sum().item()
+    ent_norm = ent / math.log(N + eps)
+    return float(ent_norm)
+
+def heatmap_gini(h: torch.Tensor, eps: float = 1e-8) -> float:
+    p = normalize_heatmap(h, eps).view(-1)
+    if p.numel() == 0:
+        return 0.0
+    p_sorted, _ = torch.sort(p)
+    N = p_sorted.numel()
+    idx = torch.arange(1, N+1, device=p_sorted.device, dtype=p_sorted.dtype)
+    num = (2 * idx * p_sorted).sum()
+    den = N * p_sorted.sum() + eps
+    gini = (num / den - (N + 1) / N).item()
+    return float(gini)
+
 def _extract_heatmap_from_output(out: Dict[str, torch.Tensor],
                                  prefer: str = "rtokens_up") -> torch.Tensor:
-    """
-    out: dict trả về từ attributor.attribute
-    prefer:
-      - 'rtokens_up': dùng H×W
-      - 'rpix_sum' : nếu có 'rpix', dùng tổng kênh
-    """
     if prefer == "rtokens_up" and ("rtokens_up" in out):
         return out["rtokens_up"]       # [B,H,W]
     if prefer == "rpix_sum" and ("rpix" in out):
         return out["rpix"].sum(dim=1)  # [B,H,W]
-    # fallback: ưu tiên rtokens_up rồi rpix
     if "rtokens_up" in out:
         return out["rtokens_up"]
     if "rpix" in out:
@@ -466,30 +456,16 @@ def _extract_heatmap_from_output(out: Dict[str, torch.Tensor],
     raise KeyError("Output không có 'rtokens_up' hoặc 'rpix'.")
 
 @torch.no_grad()
-def evaluate_attributor(
+def evaluate_attributor_token(
     attributor,
     backbone: torch.nn.Module,
     dataloader,
     device: str = "cuda",
     steps: int = 50,
     use_pred: bool = True,
-    prefer_map: str = "rtokens_up",
+    prefer_map: str = "rtokens_up",   # dùng khi phải fallback từ pixel
     max_batches: int | None = None
 ) -> Dict[str, float]:
-    """
-    Đánh giá một phương pháp attribution trên toàn bộ dataloader.
-
-    - attributor: SSRP, ViTGradCAM, Occlusion, KernelSHAP,
-                  IntegratedGradients, Rollout, ...
-      (phải có thuộc tính `.model` trỏ tới backbone).
-
-    - backbone: model phân loại (thường chính là attributor.model).
-
-    - dataloader: yield (x, y) hoặc dict{'image','label',...}.
-
-    Trả về: dict với mean của:
-      'auc_del', 'auc_ins', 'entropy', 'gini', 'n_samples'.
-    """
 
     backbone.to(device).eval()
     attributor.model.to(device).eval()
@@ -509,10 +485,10 @@ def evaluate_attributor(
         elif isinstance(batch, dict):
             x = None; y = None
             for k in ("image", "img", "tensor", "x"):
-                if k in batch: 
+                if k in batch:
                     x = batch[k]; break
             for k in ("label", "y", "target"):
-                if k in batch: 
+                if k in batch:
                     y = batch[k]; break
             if x is None:
                 raise ValueError("Không tìm thấy key ảnh trong batch dict.")
@@ -525,25 +501,40 @@ def evaluate_attributor(
 
         B = x.size(0)
 
-        # 2) tính y_true cho cả batch
+        # 2) y_true cho batch
         if use_pred or y is None:
             logits = backbone(x)
             y_true_all = logits.argmax(dim=1)
         else:
             y_true_all = y.view(-1)
 
-        # 3) duyệt từng ảnh trong batch (attribute luôn với B=1)
+        # 3) duyệt từng ảnh
         for i in range(B):
             xi = x[i:i+1]              # [1,3,H,W]
             yi = y_true_all[i:i+1]     # [1]
 
             out = attributor.attribute(xi, yi)
-            hi_all = _extract_heatmap_from_output(out, prefer=prefer_map)  # [1,H,W]
-            hi = hi_all[0]             # [H,W]
 
-            di = deletion_insertion_auc(backbone, xi, yi, hi, steps=steps)
-            ent = heatmap_entropy(hi)
-            gi  = heatmap_gini(hi)
+            # ưu tiên: token map trực tiếp
+            if "rtokens" in out:
+                hi_tok = out["rtokens"][0]          # [Hn,Wn]
+            else:
+                # fallback: lấy pixel map rồi downsample về token
+                hi_all = _extract_heatmap_from_output(out, prefer=prefer_map)  # [1,H,W]
+                hi_pix = hi_all[0]                    # [H,W]
+                hi_tok = to_token_heatmap(hi_pix, backbone)  # [Hn,Wn]
+
+            di = deletion_insertion_auc_tokens(
+                model=backbone,
+                x=xi,
+                y_true=yi,
+                heat_tok=hi_tok,
+                steps=steps,
+                baseline=None,
+                device=device,
+            )
+            ent = heatmap_entropy(hi_tok)
+            gi  = heatmap_gini(hi_tok)
 
             auc_del_list.append(di["auc_del"])
             auc_ins_list.append(di["auc_ins"])

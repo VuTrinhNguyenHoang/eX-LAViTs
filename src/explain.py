@@ -6,100 +6,127 @@ import numpy as np
 import math
 
 def _get_item(ds, idx):
-        s = ds[idx]
-        img, y = None, None
-        if isinstance(s, (tuple, list)):
-            img = s[0]
-            if len(s) > 1: y = s[1]
-        elif isinstance(s, dict):
-            for k in ("image", "img", "tensor", "x"): 
-                if k in s: img = s[k]; break
-            for k in ("label", "y", "target"): 
-                if k in s: y = s[k]; break
-        else:
-            img = s
-        if not torch.is_tensor(img):
-            raise TypeError("Dataset phải trả về ảnh dạng torch.Tensor sau transform.")
-        if y is not None and not torch.is_tensor(y):
-            y = torch.tensor(y)
-        return img, y
+    s = ds[idx]
+    img, y = None, None
+    if isinstance(s, (tuple, list)):
+        img = s[0]
+        if len(s) > 1:
+            y = s[1]
+    elif isinstance(s, dict):
+        for k in ("image", "img", "tensor", "x"):
+            if k in s:
+                img = s[k]
+                break
+        for k in ("label", "y", "target"):
+            if k in s:
+                y = s[k]
+                break
+    else:
+        img = s
+    if not torch.is_tensor(img):
+        raise TypeError("Dataset phải trả về ảnh dạng torch.Tensor sau transform.")
+    if y is not None and not torch.is_tensor(y):
+        y = torch.tensor(y)
+    return img, y
 
 def _to_device_batch(x, y, device):
-        x = x.unsqueeze(0).to(device, non_blocking=True)
-        y = None if y is None else y.view(-1).to(device)
-        return x, y
+    x = x.unsqueeze(0).to(device, non_blocking=True)
+    y = None if y is None else y.view(-1).to(device)
+    return x, y
 
 def _denorm_img(x, mean, std):
-        mean = torch.tensor(mean, dtype=x.dtype, device=x.device).view(-1,1,1)
-        std  = torch.tensor(std,  dtype=x.dtype, device=x.device).view(-1,1,1)
-        img = x * std + mean
-        return img.clamp(0,1).permute(1,2,0).detach().cpu().numpy()
+    mean = torch.tensor(mean, dtype=x.dtype, device=x.device).view(-1,1,1)
+    std  = torch.tensor(std,  dtype=x.dtype, device=x.device).view(-1,1,1)
+    img = x * std + mean
+    return img.clamp(0,1).permute(1,2,0).detach().cpu().numpy()
 
 def _norm01_quantile(h, q=0.99, eps=1e-6):
-        if h.dim() == 3:
-            h = h.squeeze(0)
-        hp = h.clamp_min(0)
-        flat = hp.flatten()
-        if flat.numel() == 0:
-            return torch.zeros_like(h)
-        vmax = torch.quantile(flat, q)
-        if (not torch.isfinite(vmax)) or vmax <= 0:
-            vmax = flat.max()
-        vmax = vmax + eps
-        return (hp / vmax).clamp(0,1)
+    if h.dim() == 3:
+        h = h.squeeze(0)
+    hp = h.clamp_min(0)
+    flat = hp.flatten()
+    if flat.numel() == 0:
+        return torch.zeros_like(h)
+    vmax = torch.quantile(flat, q)
+    if (not torch.isfinite(vmax)) or vmax <= 0:
+        vmax = flat.max()
+    vmax = vmax + eps
+    return (hp / vmax).clamp(0,1)
 
 def _overlay(img_hw3, heat_hw, alpha=0.45, cmap="jet"):
-        cmap_fn = cm.get_cmap(cmap)
-        heat_rgb = cmap_fn(heat_hw.detach().cpu().numpy())[...,:3]
-        overlay = (1 - alpha) * img_hw3 + alpha * heat_rgb
-        return overlay
+    cmap_fn = cm.get_cmap(cmap)
+    heat_rgb = cmap_fn(heat_hw.detach().cpu().numpy())[...,:3]
+    overlay = (1 - alpha) * img_hw3 + alpha * heat_rgb
+    return overlay
 
-def visualize_methods(ds, idx, attr_dict, use_pred, device, mean=(0.485,0.456,0.406),
-                      std=(0.229,0.224,0.225), alpha: float = 0.45, cmap_name: str = "jet",
-                      q: float = 0.99):
+def visualize_methods(
+    ds,
+    idx,
+    attr_dict: OrderedDict,
+    use_pred: bool,
+    device: str,
+    mean=(0.485,0.456,0.406),
+    std=(0.229,0.224,0.225),
+    alpha: float = 0.45,
+    cmap_name: str = "jet",
+    q: float = 0.99
+):
     """
     ds: dataset, phần tử ds[idx] -> (img, label) hoặc dict.
-    attr_dict: OrderedDict tên_phương_pháp -> đối tượng Attributor (SSRP, IG, ...)
+    attr_dict: OrderedDict tên_phương_pháp -> Attributor (SSRP, IG, ...)
 
-    Mỗi attributor cần có hàm:
-        attribute(x, y_true) -> dict
-    trong đó dict có:
-        'rtokens_up': [1,H,W] hoặc
-        'rpix': [1,3,H,W] (khi không có 'rtokens_up').
+    Mỗi attributor nên có:
+        attribute(x, y_true) -> dict với:
+          - 'rtokens_up': [B,H,W] (ưu tiên cho trực quan)
+          - (hoặc) 'rtokens': [B,Hn,Wn]  -> sẽ tự upsample
+          - (fallback) 'rpix': [B,3,H,W]
     """
 
+    # 1) lấy mẫu
     img_t, y = _get_item(ds, idx)
     x, y = _to_device_batch(img_t, y, device)
 
-    # 2) Xác định y_true (dùng backbone đầu tiên trong attr_dict)
+    # 2) y_true từ backbone đầu tiên
     first_attr = next(iter(attr_dict.values()))
     backbone = getattr(first_attr, "model", None)
     if backbone is None:
         raise RuntimeError("Các Attributor cần có thuộc tính .model để suy ra y_true.")
-    backbone.to(device)
-    backbone.eval()
+    backbone.to(device).eval()
     with torch.no_grad():
         logits_pred = backbone(x)
         pred_cls = logits_pred.argmax(dim=1)
     y_true = pred_cls if (use_pred or y is None) else y
 
-    # 3) Ảnh gốc denorm
+    # 3) ảnh gốc denorm
     img_np = _denorm_img(img_t.to(device), mean, std)
 
-    # 4) Thu heatmap từ từng phương pháp
+    # 4) thu heatmap (pixel-level, dùng cho overlay) từ từng phương pháp
     heatmaps = OrderedDict()
+    B, _, H, W = x.shape
+
     for name, attr in attr_dict.items():
-        attr.model.to(device)
+        attr.model.to(device).eval()
         out = attr.attribute(x, y_true)
+
         if "rtokens_up" in out:
-            h = out["rtokens_up"][0]
+            # đã có upsample sẵn H×W
+            h = out["rtokens_up"][0]      # [H,W]
+        elif "rtokens" in out:
+            # chỉ có token map -> tự upsample
+            rtok = out["rtokens"][0]      # [Hn,Wn]
+            cam = rtok.unsqueeze(0).unsqueeze(0)  # [1,1,Hn,Wn]
+            h_up = F.interpolate(cam, size=(H, W), mode="bilinear",
+                                  align_corners=False)[0,0]
+            h = h_up
         elif "rpix" in out:
-            h = out["rpix"][0].sum(dim=0)
+            # fallback: pixel-level theo kênh
+            h = out["rpix"][0].sum(dim=0)  # [H,W]
         else:
-            raise RuntimeError(f"{name}: không tìm thấy 'rtokens_up' hoặc 'rpix' trong output.")
+            raise RuntimeError(f"{name}: không tìm thấy 'rtokens_up', 'rtokens' hoặc 'rpix' trong output.")
+
         heatmaps[name] = _norm01_quantile(h, q=q)
 
-    # 5) Vẽ lưới: 1 ảnh gốc + N heatmap
+    # 5) vẽ lưới
     n_methods = len(heatmaps)
     n_plots = n_methods + 1
     ncols = min(4, n_plots)
@@ -108,12 +135,12 @@ def visualize_methods(ds, idx, attr_dict, use_pred, device, mean=(0.485,0.456,0.
     fig, axs = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
     axs = np.array(axs).reshape(nrows, ncols)
 
-    # Ảnh gốc
+    # ảnh gốc
     axs[0,0].imshow(img_np)
     axs[0,0].set_title("Original")
     axs[0,0].axis("off")
 
-    # Các heatmap
+    # các heatmap
     i = 1
     for name, h in heatmaps.items():
         r = i // ncols
@@ -123,7 +150,7 @@ def visualize_methods(ds, idx, attr_dict, use_pred, device, mean=(0.485,0.456,0.
         axs[r, c].axis("off")
         i += 1
 
-    # Ẩn ô dư
+    # ẩn ô dư
     while i < nrows * ncols:
         r = i // ncols
         c = i % ncols

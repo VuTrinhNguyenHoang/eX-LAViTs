@@ -82,5 +82,9 @@ class KernelSHAP(nn.Module):
             phi_pos = phi_pos / phi_pos.max()
 
         cam = phi_pos.view(1,1,Hn,Wn)
+        rtokens = cam[:,0]
         cam_up = F.interpolate(cam, size=(H,W), mode='bilinear', align_corners=False)[:,0]
-        return {"rtokens_up": cam_up.detach()}
+        return {
+            "rtokens":    rtokens.detach(),
+            "rtokens_up": cam_up.detach()
+        }

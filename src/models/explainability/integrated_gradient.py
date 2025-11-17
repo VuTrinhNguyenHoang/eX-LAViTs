@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 
 class IntegratedGradient(nn.Module):
@@ -48,4 +49,19 @@ class IntegratedGradient(nn.Module):
         avg_grad = total_grad / steps
         ig = delta * avg_grad         # [B,3,H,W]
         heat = ig.sum(dim=1)          # [B,H,W]
-        return {"rpix": ig.detach(), "rtokens_up": heat.detach()}
+
+        pe = self.model.patch_embed.proj
+        S  = pe.stride[0]
+        Hn, Wn = H // S, W // S
+
+        heat_tok = F.avg_pool2d(heat, kernel_size=S, stride=S)   # [B,1,Hn,Wn]
+        rtokens  = heat_tok[:, 0]                                # [B,Hn,Wn]
+
+        # upsample để visualize
+        rtokens_up = F.interpolate(heat_tok, size=(H, W),
+                                mode="bilinear", align_corners=False)[:, 0]
+
+        return {
+            "rtokens":     rtokens.detach(), # token-level
+            "rtokens_up":  rtokens_up.detach()
+        }

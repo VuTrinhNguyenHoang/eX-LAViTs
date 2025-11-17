@@ -111,10 +111,20 @@ class ViTGradCAM(nn.Module):
         if smooth <= 0:
             logits, A, G = self._forward_backward_once(x, y_true)
             cam_tokens = self._cam_from_AG(A, G)
+            if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
+                Hn, Wn = self.model.patch_embed.grid_size
+            else:
+                Hn, Wn = H // self.stride, W // self.stride
+            cam_map = cam_tokens.view(B, Hn, Wn)        # [B,Hn,Wn]
+
             cam_up = self._upsample_tokens(cam_tokens, H, W)
-            return {"rtokens_up": cam_up.detach(),
-                    "logits": logits,
-                    "cam_tokens": cam_tokens.detach()}
+
+            return {
+                "rtokens":    cam_map.detach(),         # token-level
+                "rtokens_up": cam_up.detach(),          # pixel-level (vis)
+                "logits":     logits,
+                "cam_tokens": cam_tokens.detach(),
+            }
 
         cams = []
         last_logits = None
@@ -125,7 +135,17 @@ class ViTGradCAM(nn.Module):
             last_logits = logits
             cams.append(self._cam_from_AG(A, G))
         cam_tokens = torch.stack(cams, dim=0).mean(0)
+        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
+            Hn, Wn = self.model.patch_embed.grid_size
+        else:
+            Hn, Wn = H // self.stride, W // self.stride
+        cam_map = cam_tokens.view(B, Hn, Wn)        # [B,Hn,Wn]
+
         cam_up = self._upsample_tokens(cam_tokens, H, W)
-        return {"rtokens_up": cam_up.detach(),
-                "logits": last_logits,
-                "cam_tokens": cam_tokens.detach()}
+
+        return {
+            "rtokens":    cam_map.detach(),         # token-level
+            "rtokens_up": cam_up.detach(),          # pixel-level (vis)
+            "logits":     logits,
+            "cam_tokens": cam_tokens.detach(),
+        }

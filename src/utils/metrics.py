@@ -289,16 +289,6 @@ def get_memory_usage() -> float:
         else:
             return 0.0  # Unable to get memory info
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from sklearn.metrics import classification_report, confusion_matrix
-from typing import Dict, Any, Optional, Tuple
-import psutil
-import os, math
-from tqdm.auto import tqdm
-
 def normalize_heatmap(h: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     if h.dim() == 3:
         # nếu có kênh, tổng theo kênh
@@ -372,13 +362,7 @@ def deletion_insertion_auc(
 ) -> Dict[str, float]:
     """
     Tính AUC–Deletion và AUC–Insertion cho MỘT ảnh.
-
-    - Deletion: bắt đầu từ ảnh gốc, lần lượt thay top-pixel theo heatmap bằng baseline.
-      -> AUC càng nhỏ càng tốt.
-    - Insertion: bắt đầu từ baseline, lần lượt chèn top-pixel từ ảnh gốc.
-      -> AUC càng lớn càng tốt.
-
-    Trả về: {'auc_del': float, 'auc_ins': float}
+    Score = softmax prob của lớp y_true -> đảm bảo AUC ∈ [0,1].
     """
     assert x.size(0) == 1, "Hàm này hiện thiết kế cho batch=1."
     if device is not None:
@@ -391,7 +375,7 @@ def deletion_insertion_auc(
 
     B, C, H, W = x.shape
     if baseline is None:
-        baseline = torch.zeros_like(x)  # ảnh nền = 0 (tương ứng mean nếu đã normalize)
+        baseline = torch.zeros_like(x)
 
     # dùng positive heatmap, flatten
     if heatmap.dim() == 3 and heatmap.size(0) > 1:
@@ -404,15 +388,11 @@ def deletion_insertion_auc(
     if steps > N:
         steps = N
 
-    # thứ tự pixel từ quan trọng -> kém
-    order = torch.argsort(flat, descending=True)
-
-    # số pixel thao tác mỗi bước (step cuối có thể ít hơn)
-    k = N // steps
+    order = torch.argsort(flat, descending=True)  # index pixel theo importance
+    k = max(1, N // steps)                        # số pixel mỗi bước
 
     def _scores_along_path(mode: str) -> np.ndarray:
         scores = []
-        # mask khởi điểm
         if mode == "deletion":
             mask_flat = torch.ones(N, device=device)
         else:  # insertion
@@ -422,13 +402,13 @@ def deletion_insertion_auc(
             mask = mask_flat.view(1, 1, H, W)
             x_pert = _perturb_image(x, baseline, mask, mode)
             logits = model(x_pert)
-            score = logits.gather(1, y_true[:, None]).squeeze(1)  # [1]
+            probs = torch.softmax(logits, dim=1)
+            score = probs.gather(1, y_true[:, None]).squeeze(1)  # [1]
             scores.append(score.item())
 
             if s == steps:
                 break
 
-            # cập nhật mask cho bước tiếp theo
             start = s * k
             end = (s + 1) * k if s < steps - 1 else N
             idx = order[start:end]
@@ -439,21 +419,26 @@ def deletion_insertion_auc(
 
         return np.array(scores, dtype=np.float64)
 
-    # Deletion: chuẩn hoá về [0,1] với điểm đầu = 1
-    scores_del = _scores_along_path("deletion")
-    if abs(scores_del[0]) < 1e-8:
-        scores_del_norm = scores_del  # tránh chia 0, curve gần như flat
-    else:
-        scores_del_norm = scores_del / (scores_del[0] + 1e-8)
+    # Deletion & insertion (probabilities ∈ [0,1])
+    scores_del = _scores_along_path("deletion")   # từ full-ảnh -> baseline
+    scores_ins = _scores_along_path("insertion")  # từ baseline -> full-ảnh
 
-    # Insertion: chuẩn hoá sao cho baseline -> 0, full -> 1
-    scores_ins = _scores_along_path("insertion")
-    s0, sT = scores_ins[0], scores_ins[-1]
-    denom = (sT - s0)
-    if abs(denom) < 1e-8:
-        scores_ins_norm = scores_ins - s0  # gần như 0 hết
+    p_full = scores_del[0]        # prob tại ảnh gốc
+    p_base = scores_ins[0]        # prob tại baseline (thường ~0)
+
+    # chuẩn hoá về [0,1] và clamp để tránh overshoot / numeric noise
+    # Deletion: 1 tại full ảnh, ~0 tại baseline
+    if p_full < 1e-8:
+        scores_del_norm = np.zeros_like(scores_del)
     else:
-        scores_ins_norm = (scores_ins - s0) / (denom + 1e-8)
+        scores_del_norm = np.clip(scores_del / (p_full + 1e-8), 0.0, 1.0)
+
+    # Insertion: 0 tại baseline, 1 tại full ảnh
+    denom = p_full - p_base
+    if abs(denom) < 1e-8:
+        scores_ins_norm = np.zeros_like(scores_ins)
+    else:
+        scores_ins_norm = np.clip((scores_ins - p_base) / (denom + 1e-8), 0.0, 1.0)
 
     xs = np.linspace(0.0, 1.0, len(scores_del_norm))
     auc_del = float(np.trapz(scores_del_norm, xs))
@@ -576,3 +561,4 @@ def evaluate_attributor(
         "gini_mean": _mean(gini_list),
         "n_samples": n_samples,
     }
+

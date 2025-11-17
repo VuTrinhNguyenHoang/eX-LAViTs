@@ -1,111 +1,86 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class SHAP(nn.Module):
-    def __init__(self, model, samples=50, has_cls=True, eps=1e-6):
+from typing import Optional
+
+class KernelSHAP(nn.Module):
+    """
+    KernelSHAP xấp xỉ trên không gian patch.
+
+    Hiện tại triển khai đơn giản với batch=1 (thường dùng cho XAI).
+    Trả về: {'rtokens_up': [1,H,W]}.
+    """
+    def __init__(self, model: nn.Module,
+                 nsamples: int = 256):
         super().__init__()
         self.model = model
-        self.samples = samples
-        self.has_cls = has_cls and hasattr(model, "cls_token")
-        self.eps = eps
-    
-    @torch.no_grad()
-    def _forward_from_tokens(self, tokens: torch.Tensor):
-        m = self.model
-        x = tokens
-        B, N, C = x.shape
+        self.nsamples = int(nsamples)
+        pe = self.model.patch_embed.proj
+        self.patch_size = pe.kernel_size[0]
+        self.stride = pe.stride[0]
 
-        if self.has_cls:
-            cls_token = m.cls_token.expand(B, -1, -1)
-            x = torch.cat([cls_token, x], dim=1)
-        
-        if hasattr(m, "pos_embed"):
-            pe = m.pos_embed
-            if pe.size(1) != x.size(1):
-                pe = pe[:, : x.size(1), :]
-            x = x + pe
-        
-        if hasattr(m, "pos_drop"):
-            x = m.pos_drop(x)
+    def _grid_hw(self, x: torch.Tensor):
+        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
+            return self.model.patch_embed.grid_size
+        B, _, H, W = x.shape
+        return H // self.patch_size, W // self.patch_size
 
-        for blk in m.blocks:
-            x = blk(x) 
-
-        if hasattr(m, "norm"):
-            x = m.norm(x)
-
-        if self.has_cls:
-            feat = x[:, 0] 
-        else:
-            feat = x.mean(dim=1)
-
-        if hasattr(m, "head") and isinstance(m.head, nn.Linear):
-            logits = m.head(feat)                          # [B,K]
-        else:
-            logits = feat
-        
-        return logits
-
-    @torch.no_grad()
-    def attribute(self, x, y_true):
+    def attribute(self,
+                  x: torch.Tensor,
+                  y_true: Optional[torch.Tensor] = None,
+                  baseline: Optional[torch.Tensor] = None,
+                  nsamples: Optional[int] = None):
+        assert x.size(0) == 1, "KernelSHAPAttributor hiện chỉ hỗ trợ batch=1."
         self.model.eval()
+        with torch.no_grad():
+            if y_true is None:
+                logits = self.model(x)
+                y_true = logits.argmax(dim=1)
+
+        if baseline is None:
+            baseline = torch.zeros_like(x)
+
+        nsamples = int(nsamples or self.nsamples)
         device = x.device
+        B, _, H, W = x.shape
+        Hn, Wn = self._grid_hw(x)
+        Np = Hn * Wn
 
-        tokens = self.model.patch_embed(x)  # [B,N,C]
-        B,N,C = tokens.shape
-        
-        y_true = y_true.view(-1).to(device)
-        assert y_true.size(0) == B
-
-        logits_full = self._forward_from_tokens(tokens)    # [B,K]
-        score_full = logits_full.gather(1, y_true[:, None])[:, 0]  # [B]
+        delta = x - baseline
 
         Ms = []
         Ys = []
-
-        L = self.samples
-        for _ in range(L):
-            m = torch.randint(0, 2, (B, N), device=device, dtype=torch.float32)
-            s = m.sum(dim=1, keepdim=True)
-
-            all_zero = (s == 0)
-            all_one  = (s == N)
-            if all_zero.any():
-                m[all_zero.squeeze(1)] = 1.0
-            if all_one.any():
-                m[all_one.squeeze(1)] = 0.0
-
-            t = tokens * m.unsqueeze(-1)
-            logits = self._forward_from_tokens(t)
-            score = logits.gather(1, y_true[:, None])[:, 0]
-
+        for _ in range(nsamples):
+            m = torch.randint(0, 2, (Np,), device=device, dtype=torch.float32)
+            s = m.sum()
+            if s == 0 or s == Np:
+                m = 1.0 - m
             Ms.append(m)
-            Ys.append(score)
 
-        M = torch.stack(Ms, dim=1)  # [B,N,S]
-        Y = torch.stack(Ys, dim=1)          # [B,S]
+            mask = m.view(1,1,Hn,Wn)
+            mask_up = F.interpolate(mask, size=(H,W), mode='nearest')
+            x_m = baseline + mask_up * delta
 
-        S_card = M.sum(dim=-1)                             # [B,L]
-        S_card = S_card.clamp_(1, N-1)                     # tránh 0,N
-        w = (N - 1) / (S_card * (N - S_card))              # [B,L]
+            with torch.no_grad():
+                logits_m = self.model(x_m)
+                y_m = logits_m.gather(1, y_true[:,None]).squeeze(1)
+            Ys.append(y_m)
 
-        phi_list = []
-        eyeN = torch.eye(N, device=device)
+        M = torch.stack(Ms, dim=0)          # [L,Np]
+        Y = torch.stack(Ys, dim=0)          # [L]
 
-        for b in range(B):
-            Mb = M[b]                                      # [L,N]
-            Yb = Y[b]                                      # [L]
-            wb = w[b]                                      # [L]
+        s_frac = M.mean(dim=1, keepdim=True).clamp_(1e-6, 1-1e-6)
+        w = (Np - 1) / (s_frac * (1 - s_frac))      # [L,1]
+        MtW = (M * w).t()                           # [Np,L]
+        A = MtW @ M + 1e-6 * torch.eye(Np, device=device)
+        b = MtW @ Y.unsqueeze(-1)                   # [Np,1]
+        phi = torch.linalg.solve(A, b).squeeze(-1)  # [Np]
 
-            Wb = torch.diag(wb)                            # [L,L]
-            A = Mb.t() @ Wb @ Mb + 1e-6 * eyeN             # [N,N]
-            b_vec = Mb.t() @ (Wb @ Yb)                     # [N]
+        phi_pos = phi.clamp_min(0)
+        if phi_pos.max() > 0:
+            phi_pos = phi_pos / phi_pos.max()
 
-            phib = torch.linalg.solve(A, b_vec)            # [N]
-            # clamp dương
-            phib = phib.clamp_min(0.)
-            phi_list.append(phib)
-
-        phi = torch.stack(phi_list, dim=0)                 # [B,N]
-
-        return {"rtokens": phi}
+        cam = phi_pos.view(1,1,Hn,Wn)
+        cam_up = F.interpolate(cam, size=(H,W), mode='bilinear', align_corners=False)[:,0]
+        return {"rtokens_up": cam_up.detach()}

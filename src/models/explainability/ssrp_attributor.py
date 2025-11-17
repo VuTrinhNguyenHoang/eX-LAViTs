@@ -1,25 +1,26 @@
-import math
-from typing import List, Dict, Tuple
-
+from typing import Dict, List, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class SSRP(nn.Module):
-    def __init__(self, model: nn.Module, r_modes: int = 8, lam: float = 0.3, use_shap: bool = True, shap_samples: int = 32, eps: float = 1e-6,
-                 k_modes: int = 3, token_p: float = 1.5):
+    def __init__(self,
+                 model: nn.Module,
+                 r_modes: int = 8,
+                 lam: float = 0.3,
+                 use_shap: bool = True,
+                 shap_samples: int = 32,
+                 eps: float = 1e-6):
         super().__init__()
         self.model = model
-        self.r = r_modes
-        self.lam = lam
-        self.use_shap = (use_shap and shap_samples > 0)
-        self.shap_samples = shap_samples
-        self.eps = eps
+        self.r = int(r_modes)
+        self.lam = float(lam)
+        self.use_shap = bool(use_shap and shap_samples > 0)
+        self.shap_samples = int(shap_samples)
+        self.eps = float(eps)
         self.grid_hw = getattr(self.model.patch_embed, "grid_size", None)
-
-        self.k_modes = k_modes
-        self.token_p = token_p
-
+        
         # backbone structure
         self.blocks: List[nn.Module] = list(getattr(self.model, "blocks"))
         self.has_cls = hasattr(self.model, "cls_token")
@@ -29,10 +30,16 @@ class SSRP(nn.Module):
         self._f_hooks: List[torch.utils.hooks.RemovableHandle] = []
         self.cache: List[Dict[str, torch.Tensor]] = []
 
+        # patch embed
+        self.patch_conv: nn.Conv2d = self.model.patch_embed.proj
+        self.patch_size = self.patch_conv.kernel_size[0]
+        self.stride = self.patch_conv.stride[0]
+
+    # --------------------- utils ---------------------
     @staticmethod
     def _pos(x: torch.Tensor) -> torch.Tensor:
         return x.clamp_min(0.)
-    
+
     @staticmethod
     def _lrp_linear_zplus(R_out: torch.Tensor, X: torch.Tensor, W: nn.Linear, eps: float) -> torch.Tensor:
         # X:[B,*,Cin], W.weight:[Cout,Cin], R_out:[B,*,Cout]
@@ -42,7 +49,7 @@ class SSRP(nn.Module):
         S  = R_out / Z
         C  = torch.einsum('...o,oc->...c', S, Wp)
         return Xp * C
-    
+
     def _clear(self):
         for h in self._f_hooks:
             h.remove()
@@ -142,7 +149,7 @@ class SSRP(nn.Module):
     # --------------------- one block SSRP ---------------------
     def _ssrp_block(self, li: int, R_x1: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Input:  R_x1 tại x1 (sau residual attn), [B,N,C]
+        Input:  R_x1 at x1 (sau residual attn), [B,N,C]
         Output: R_skip (về skip attn), R_attn_tokensC (N×C)
         """
         blk = self.blocks[li]
@@ -202,14 +209,6 @@ class SSRP(nn.Module):
         # scores theo mode
         g_mode = S * (z * Pi).sum(dim=2)                        # [B,H,r]
         w_mode = (g_mode.abs() + self.eps)
-
-        k = min(self.k_modes, w_mode.size(-1))
-        if k > 0 and k < w_mode.size(-1):
-            _, idx = w_mode.topk(k, dim=-1, largest=True, sorted=False)
-            mask = torch.zeros_like(w_mode)
-            mask.scatter_(-1, idx, 1.0)
-            w_mode = w_mode * mask
-
         w_mode = w_mode / (w_mode.sum(dim=-1, keepdim=True) + self.eps)      # [B,H,r]
         R_spec = R_head.unsqueeze(-1) * w_mode                                  # [B,H,r]
 
@@ -233,12 +232,6 @@ class SSRP(nn.Module):
         R_tokens = R_tokens.clamp_min(0)
         # conservation: \sum_n R_tokens = \sum_h R_head = mass_attn
 
-        if self.token_p != 1.0:
-            mass = R_tokens.sum(dim=1, keepdim=True)  # [B,1]
-            R_tokens = R_tokens ** self.token_p
-            R_tokens = R_tokens / (R_tokens.sum(dim=1, keepdim=True) + self.eps) * mass
-
-        # tuỳ chọn làm mượt token spatial một chút (nhưng vẫn ở token-level)
         if self.grid_hw is not None:
             Hn, Wn = self.grid_hw
         else:
@@ -247,33 +240,88 @@ class SSRP(nn.Module):
 
         Rt_all = R_tokens  # [B,N]
         if self.has_cls:
-            Rt = R_tokens[:, 1:].view(B, 1, Hn, Wn)   # bỏ CLS, chỉ làm mượt patch
-            mass0 = Rt.sum((1, 2, 3), keepdim=True)
+            Rt = (R_tokens[:, 1:] if self.has_cls else R_tokens).view(B,1,Hn,Wn)
+            mass0 = Rt.sum((1,2,3), keepdim=True)
             Rt = F.avg_pool2d(Rt, kernel_size=5, stride=1, padding=2)
-            Rt = Rt * (mass0 / (Rt.sum((1, 2, 3), keepdim=True) + self.eps))
-            R_tokens = torch.cat([R_tokens[:, :1], Rt.view(B, -1)], dim=1)
+            Rt = Rt * (mass0 / (Rt.sum((1,2,3), keepdim=True) + self.eps))
+            R_tokens = torch.cat([R_tokens[:, :1], Rt.view(B, -1)], dim=1) if self.has_cls else Rt.view(B,-1)
         else:
             Rt = Rt_all.view(B, 1, Hn, Wn)
             mass0 = Rt.view(B, -1).sum(1, keepdim=True)
             Rt = F.avg_pool2d(Rt, kernel_size=5, stride=1, padding=1)
             mass1 = Rt.view(B, -1).sum(1, keepdim=True) + self.eps
             R_tokens = Rt.view(B, -1) * (mass0 / mass1)
-
-        # nâng R_tokens → N×C theo tỉ lệ kênh dương của x_in để tiếp tục propagation
+        
+        # nâng R_tokens → N×C theo tỉ lệ kênh dương của x_in
         x_pos = self._pos(x_in) + self.eps
         chan_sum = x_pos.sum(dim=-1, keepdim=True)               # [B,N,1]
         R_attn_tokensC = x_pos / chan_sum * R_tokens.unsqueeze(-1)
         return R_skip2, R_attn_tokensC
+
+    # --------------------- pixel projection ---------------------
+    def _tokens_to_pixels(self, R_tokensC: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            B, Cin, H, W = x.shape
+            P, S = self.patch_size, self.stride
+            conv: nn.Conv2d = self.patch_conv
+            D = conv.out_channels
     
+            R_patch = R_tokensC[:, 1:, :] if self.has_cls else R_tokensC  # [B,Np,D]
+    
+            # 1) ảnh dương ổn định
+            x_pos = x - x.amin(dim=(2,3), keepdim=True)  # ≥0
+    
+            # 2) unfold
+            patches = F.unfold(x_pos, kernel_size=P, stride=S)     # [B,K,Np]
+            K = patches.size(1)
+            Wpos = self._pos(conv.weight).view(D, K)               # [D,K]
+    
+            # 3) cửa sổ: chỉ dùng Hann khi có chồng lấn
+            if S < P:
+                w1 = torch.hann_window(P, device=x.device, dtype=x.dtype)
+                w2 = (w1[:, None] * w1[None, :])                   # [P,P]
+                w2 = (w2 / w2.mean()).clamp_min(1e-6)
+                wflat = w2.reshape(1, 1, P*P).repeat(1, Cin, 1).reshape(1, Cin*P*P, 1)  # [1,K,1]
+            else:
+                wflat = torch.ones(1, Cin*P*P, 1, device=x.device, dtype=x.dtype)
+    
+            patches_w = patches * wflat
+    
+            # 4) mẫu số và phân bổ trong patch
+            bpos = 0.0
+            if self.patch_conv.bias is not None:
+                bpos = self.patch_conv.bias.clamp_min(0).view(1, D, 1)
+            denom = torch.einsum('bkn,dk->bdn', patches_w, Wpos) + bpos + self.eps  # [B,D,Np]
+            T = (R_patch.permute(0, 2, 1)) / denom                                  # [B,D,Np]
+            Smap = torch.einsum('bdn,dk->bkn', T, Wpos)                              # [B,K,Np]
+            contrib = patches_w * Smap                                              # [B,K,Np]
+    
+            # 5) fold + bù chồng lấn
+            overlap = F.fold(wflat.expand(B, -1, R_patch.size(1)), (H, W),
+                             kernel_size=P, stride=S)                                # [B,1,H,W]
+            overlap = overlap.expand(B, Cin, H, W)
+            Rpix = F.fold(contrib, (H, W), kernel_size=P, stride=S) / (overlap + 1e-6)
+    
+            # 6) chặn âm và làm mượt bảo toàn khối lượng (khử viền)
+            Rpix = Rpix.clamp_min(0)
+            ksz, sigma = 5, 1.0
+            ax = torch.arange(ksz, device=x.device, dtype=x.dtype) - (ksz-1)/2
+            g1 = torch.exp(-(ax**2)/(2*sigma**2)); g2 = (g1[:,None]*g1[None,:]); g2 /= g2.sum()
+            kernel = g2.view(1,1,ksz,ksz).repeat(Cin,1,1,1)
+            Rsm = F.conv2d(Rpix, kernel, padding=ksz//2, groups=Cin)
+            Rpix = Rsm * (Rpix.sum((2,3), keepdim=True) / (Rsm.sum((2,3), keepdim=True) + 1e-6))
+    
+            return Rpix
+
     # --------------------- main API ---------------------
     @torch.no_grad()
     def _head_exists(self) -> bool:
         return hasattr(self.model, "head") and isinstance(self.model.head, nn.Linear)
-    
+
     def attribute(self, x: torch.Tensor, y_true: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         x:[B,3,H,W], y_true:[B] class indices
-        returns: {'rtokens':[B,N]} tại input block0
+        returns: {'rpix':[B,3,H,W], 'rtokens_up':[B,H,W]}
         """
         self.model.eval()
         torch.set_grad_enabled(True)
@@ -288,7 +336,7 @@ class SSRP(nn.Module):
         tgt_score = logits.gather(1, y_true[:, None]).sum()
         tgt_score.backward(retain_graph=True)
 
-        # init R ở head bằng z+ trên CLS
+        # init R ở head bằng z+-ε
         X_L = self.cache[-1]["x_out"]                           # [B,N,C]
         if self._head_exists() and self.has_cls:
             head: nn.Linear = self.model.head
@@ -321,7 +369,7 @@ class SSRP(nn.Module):
             # MLP: z+ với q-set cho GELU
             x1_norm = blk.norm2(x1)
             pre1 = blk.mlp.fc1(x1_norm)                          # [B,N,Hid]
-            mask_q = (pre1 > 0).to(pre1.dtype)                   # q-set approx
+            mask_q = (pre1 > 0).to(pre1.dtype)                    # q-set approx
             act1 = blk.mlp.act(pre1) * mask_q
 
             R_lin2_in   = self._lrp_linear_zplus(R_mlp_share, act1, blk.mlp.fc2, self.eps)
@@ -332,9 +380,16 @@ class SSRP(nn.Module):
             R_skip2, R_attn_tokensC = self._ssrp_block(li, R_x1)
             R_x2 = R_skip2 + R_attn_tokensC
 
-        # tokens tại input block 0: sum theo kênh để ra scalar relevance per token
-        R_tokensC0 = R_x2                    # [B,N,C]
-        R_tokens0  = R_tokensC0.sum(dim=-1)  # [B,N]
+        # tokens tại input block 0
+        R_tokensC0 = R_x2
+        Rpix = self._tokens_to_pixels(R_tokensC0, x)             # [B,3,H,W]
+
+        # upsample token map (không bắt buộc)
+        R_tokens = R_tokensC0.sum(dim=-1)                        # [B,N]
+        Hn, Wn = x.shape[-2] // self.stride, x.shape[-1] // self.stride
+        R_map = R_tokens[:, 1:] if self.has_cls else R_tokens
+        R_map = R_map.view(x.size(0), 1, Hn, Wn)
+        R_up  = F.interpolate(R_map, size=x.shape[-2:], mode='bilinear', align_corners=False)[:, 0]
 
         self._clear()
-        return {"rtokens": R_tokens0}
+        return {"rpix": Rpix.detach(), "rtokens_up": R_up.detach()}

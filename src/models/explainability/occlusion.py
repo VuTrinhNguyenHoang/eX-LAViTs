@@ -1,81 +1,69 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from typing import Optional
 
 class Occlusion(nn.Module):
-    def __init__(self, model: nn.Module, has_cls: bool = True):
+    """
+    Occlusion trên từng patch: che 1 patch bằng baseline rồi đo độ giảm logit.
+    Trả về: {'rtokens_up': [1,H,W]}.
+    """
+    def __init__(self, model: nn.Module,
+                 baseline_value: float = 0.0):
         super().__init__()
         self.model = model
-        self.has_cls = has_cls and hasattr(model, "cls_token")
+        self.baseline_value = float(baseline_value)
+        pe = self.model.patch_embed.proj
+        self.patch_size = pe.kernel_size[0]
+        self.stride = pe.stride[0]
 
-    @torch.no_grad()
-    def _forward_from_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        m = self.model
-        x = tokens  # [B,N,C]
-        B, N, C = x.shape
+    def _grid_hw(self, x: torch.Tensor):
+        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
+            return self.model.patch_embed.grid_size
+        B, _, H, W = x.shape
+        return H // self.patch_size, W // self.patch_size
 
-        # 1) thêm CLS nếu có
-        if self.has_cls:
-            cls_token = m.cls_token.expand(B, -1, -1)      # [B,1,C]
-            x = torch.cat([cls_token, x], dim=1)           # [B,1+N,C]
-
-        # 2) cộng pos_embed nếu có
-        if hasattr(m, "pos_embed"):
-            pe = m.pos_embed                               # [1, 1+N, C] (thường)
-            if pe.size(1) != x.size(1):
-                pe = pe[:, : x.size(1), :]
-            x = x + pe
-
-        # 3) dropout vị trí nếu có
-        if hasattr(m, "pos_drop"):
-            x = m.pos_drop(x)
-
-        # 4) qua các blocks
-        for blk in m.blocks:
-            x = blk(x)                                     # [B,1+N,C]
-
-        # 5) norm + lấy CLS (hoặc pooled)
-        if hasattr(m, "norm"):
-            x = m.norm(x)
-
-        if self.has_cls:
-            feat = x[:, 0]                                 # [B,C]
-        else:
-            feat = x.mean(dim=1)                           # [B,C]
-
-        # 6) head → logits
-        if hasattr(m, "head") and isinstance(m.head, nn.Linear):
-            logits = m.head(feat)                          # [B,K]
-        else:
-            logits = feat
-
-        return logits
-
-    @torch.no_grad()
-    def attribute(self, x, y_true):
+    def attribute(self,
+                  x: torch.Tensor,
+                  y_true: Optional[torch.Tensor] = None,
+                  baseline: Optional[torch.Tensor] = None):
+        assert x.size(0) == 1, "OcclusionAttributor hiện chỉ hỗ trợ batch=1."
         self.model.eval()
         device = x.device
-        
-        x = x.to(device)
-        y_true = y_true.view(-1).to(device)
-        B = x.size(0)
+        B, C, H, W = x.shape
+        Hn, Wn = self._grid_hw(x)
+        Np = Hn * Wn
 
-        # baseline score
-        logits_full = self.model(x)                        # [B,K]
-        base = logits_full.gather(1, y_true[:, None])[:, 0]  # [B]
+        if baseline is None:
+            baseline = torch.zeros_like(x) + self.baseline_value
 
-        # get patch embeddings
-        tokens = self.model.patch_embed(x)                 # [B,N,C]
-        B, N, C = tokens.shape
+        with torch.no_grad():
+            if y_true is None:
+                logits = self.model(x)
+                y_true = logits.argmax(dim=1)
+            logits0 = self.model(x)
+            score0 = logits0.gather(1, y_true[:,None]).squeeze(1)  # [1]
 
-        rtokens = torch.zeros(B, N, device=device)
+        delta = x - baseline
+        scores = []
 
-        for j in range(N):
-            t_masked = tokens.clone()
-            t_masked[:, j] = 0
+        for i in range(Np):
+            mask = torch.ones(1,1,Hn,Wn, device=device)
+            mask.view(-1)[i] = 0.0
+            mask_up = F.interpolate(mask, size=(H,W), mode='nearest')
+            x_occ = baseline + mask_up * delta
 
-            logits_masked = self._forward_from_tokens(t_masked)  # [B,K]
-            logit = logits_masked.gather(1, y_true[:, None])[:, 0]  # [B]
+            with torch.no_grad():
+                logits = self.model(x_occ)
+                score = logits.gather(1, y_true[:,None]).squeeze(1)
+            diff = score0 - score
+            scores.append(diff)
 
-            rtokens[:, j] = (base - logit).clamp(min=0.)
+        s = torch.stack(scores, dim=0).view(Np)  # [Np]
+        s_pos = s.clamp_min(0)
+        if s_pos.max() > 0:
+            s_pos = s_pos / s_pos.max()
 
-        return {"rtokens": rtokens}
+        cam = s_pos.view(1,1,Hn,Wn)
+        cam_up = F.interpolate(cam, size=(H,W), mode='bilinear', align_corners=False)[:,0]
+        return {"rtokens_up": cam_up.detach()}

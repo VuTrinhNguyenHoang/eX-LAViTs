@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
+from typing import Optional, Dict
 
 class IntegratedGradient(nn.Module):
     def __init__(self, model: nn.Module, steps: int = 32):
@@ -9,11 +9,18 @@ class IntegratedGradient(nn.Module):
         self.model = model
         self.steps = int(steps)
 
-    def attribute(self,
-                  x: torch.Tensor,
-                  y_true: Optional[torch.Tensor] = None,
-                  baseline: Optional[torch.Tensor] = None,
-                  steps: Optional[int] = None):
+        # lấy stride patch để gom về token
+        pe = self.model.patch_embed.proj
+        self.stride = pe.stride[0]
+
+    def attribute(
+        self,
+        x: torch.Tensor,                      # [B,3,H,W]
+        y_true: Optional[torch.Tensor] = None,
+        baseline: Optional[torch.Tensor] = None,
+        steps: Optional[int] = None
+    ) -> Dict[str, torch.Tensor]:
+
         assert x.dim() == 4 and x.size(1) == 3
         B, _, H, W = x.shape
         steps = int(steps or self.steps)
@@ -40,28 +47,35 @@ class IntegratedGradient(nn.Module):
             x_i.requires_grad_(True)
 
             self.model.zero_grad(set_to_none=True)
-            logits = self.model(x_i)
+            logits = self.model(x_i)                      # [B,K]
             score = logits.gather(1, y_true[:, None]).sum()
             score.backward()
 
             total_grad += x_i.grad.detach()
 
         avg_grad = total_grad / steps
-        ig = delta * avg_grad         # [B,3,H,W]
-        heat = ig.sum(dim=1)          # [B,H,W]
+        ig = delta * avg_grad                            # [B,3,H,W]
 
-        pe = self.model.patch_embed.proj
-        S  = pe.stride[0]
+        # pixel-level heat (nếu cần)
+        heat_pix = ig.sum(dim=1, keepdim=True)           # [B,1,H,W]
+
+        # ---- token-level: gom theo patch ----
+        S = self.stride
+        assert H % S == 0 and W % S == 0, "H,W phải chia hết cho stride patch."
         Hn, Wn = H // S, W // S
 
-        heat_tok = F.avg_pool2d(heat, kernel_size=S, stride=S)   # [B,1,Hn,Wn]
-        rtokens  = heat_tok[:, 0]                                # [B,Hn,Wn]
+        heat_tok = F.avg_pool2d(heat_pix, kernel_size=S, stride=S)  # [B,1,Hn,Wn]
+        rtokens = heat_tok[:, 0]                                    # [B,Hn,Wn]
 
-        # upsample để visualize
-        rtokens_up = F.interpolate(heat_tok, size=(H, W),
-                                mode="bilinear", align_corners=False)[:, 0]
+        # ---- upsample cho trực quan ----
+        rtokens_up = F.interpolate(
+            heat_tok,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )[:, 0]                                                     # [B,H,W]
 
         return {
-            "rtokens":     rtokens.detach(), # token-level
+            "rtokens":     rtokens.detach(),  # dùng cho metrics token-level
             "rtokens_up":  rtokens_up.detach()
         }

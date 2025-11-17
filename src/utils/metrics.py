@@ -330,6 +330,13 @@ def extract_heat_from_attr_output(
     x: torch.Tensor,
     has_cls: bool = True
 ):
+    if "rimg" in attr_out:
+        rimg = attr_out["rimg"]
+        if rimg.dim() != 4:
+            raise ValueError(f"rimg phải có shape [B,C,H,W], hiện tại: {rimg.shape}")
+        heat = rimg.sum(dim=1)
+        return heat
+    
     rtokens = attr_out["rtokens"]
     model = getattr(attr_model, "model", None)
     if model is None:

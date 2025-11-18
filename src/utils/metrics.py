@@ -496,21 +496,20 @@ def compute_ccs_top2(
 ) -> float:
     model = explainer.model
     model.eval()
-    device = x.device
-
     probs, idxs = torch.topk(logits[0], k=min(2, logits.shape[1]))
     if idxs.numel() < 2:
-        # chỉ 1 class, CCS không meaningful
         return float("nan")
-
     c1, c2 = idxs[0].view(1), idxs[1].view(1)  # [1]
 
-    with torch.no_grad():
-        _, h1 = explainer.attribute(x, target=c1, img_size=None)
-        _, h2 = explainer.attribute(x, target=c2, img_size=None)
+    # class 1
+    model.zero_grad(set_to_none=True)
+    token1, h1 = explainer.attribute(x, target=c1, img_size=None)
+    # class 2
+    model.zero_grad(set_to_none=True)
+    token2, h2 = explainer.attribute(x, target=c2, img_size=None)
 
-    h1 = h1[0, 0].reshape(-1)  # [HW]
-    h2 = h2[0, 0].reshape(-1)
+    h1 = h1[0, 0].detach().reshape(-1)  # [HW]
+    h2 = h2[0, 0].detach().reshape(-1)
 
     # chuẩn hoá vector
     h1 = h1 - h1.mean()
@@ -564,18 +563,19 @@ def evaluate_methods_on_dataset(
             explainer.model.to(device_t).eval()
 
             # 1) token_scores cho entropy/gini + AUC
-            with torch.no_grad():
-                token_scores, _ = explainer.attribute(
-                    x, target=target_cls, img_size=None
-                )  # [1,N], [1,1,H,W]
+            explainer.model.zero_grad(set_to_none=True)
+            token_scores, _ = explainer.attribute(
+                x, target=target_cls, img_size=None
+            )  # [1,N], [1,1,H,W]
+            token_scores_det = token_scores.detach()
 
-            entropy, gini = entropy_gini_from_tokens(token_scores[0])
+            entropy, gini = entropy_gini_from_tokens(token_scores_det[0])
 
             auc_del, auc_ins = compute_del_ins_auc_single(
                 model=explainer.model,
                 x=x,
                 target_cls=target_cls,
-                token_scores=token_scores,
+                token_scores=token_scores_det,
                 steps=steps_auc,
                 use_proba=use_proba_auc,
             )

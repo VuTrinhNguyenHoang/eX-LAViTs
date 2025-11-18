@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
@@ -27,8 +27,10 @@ class LinearMultiheadAttention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.attn_drop = nn.Dropout(attn_drop)
 
+        self.record_attn: bool = True
+        self.attn_map: Optional[torch.Tensor] = None
+
     def _phi(self, x: torch.Tensor) -> torch.Tensor:
-        # Ensure non-negativity for kernel feature maps
         if self.kernel == "elu":
             return F.elu(x, alpha=1.0) + 1.0
         elif self.kernel == "relu":
@@ -45,16 +47,26 @@ class LinearMultiheadAttention(nn.Module):
 
         qf = self._phi(q)
         kf = self._phi(k)
-        kf = self.attn_drop(kf)
+        kf_drop = self.attn_drop(kf)
 
-        kv = torch.matmul(kf.transpose(-2, -1), v)      # [B,H,D,D]
-        z = kf.sum(dim=2)                               # [B,H,D]
+        kv = torch.matmul(kf_drop.transpose(-2, -1), v)      # [B,H,D,D]
+        z = kf_drop.sum(dim=2)                               # [B,H,D]
         y_num = torch.matmul(qf, kv)                    # [B,H,N,D]
         y_den = torch.einsum("bhnd,bhd->bhn", qf, z)    # [B,H,N]
         y_den = y_den.unsqueeze(-1).clamp_min(self.eps) # [B,H,N,1]
 
         y = (y_num / y_den).transpose(1, 2).reshape(B, N, C)
         y = self.proj_drop(self.out_proj(y))
+
+        if self.record_attn:
+            sim = torch.einsum("bhid,bhjd->bhij", qf, kf_drop)
+            sim = sim.clamp_min(0.0)
+            attn = sim / (sim.sum(dim=-1, keepdim=True) + self.eps)
+
+            self.attn_map = attn
+            if attn.requires_grad:
+                self.attn_map.retain_grad()
+
         return y
     
 class LinearTransformerEncoderLayer(nn.Module):

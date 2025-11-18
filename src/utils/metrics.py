@@ -393,54 +393,35 @@ def entropy_gini_from_tokens(token_scores: torch.Tensor, eps: float = 1e-6):
     return entropy_norm, gini
 
 def compute_del_ins_auc_single(
-    explainer,
+    model: nn.Module,
     x: torch.Tensor,
     target_cls: torch.Tensor,
+    token_scores: torch.Tensor,
     steps: Optional[int] = None,
     use_proba: bool = False,
     eps: float = 1e-6,
 ):
-    """
-    explainer: một trong các method (LAGR, GradCAM, ...)
-    x: [1,3,H,W]
-    target_cls: [1] (index class)
-    steps: số bước, nếu None -> = N_patches
-    use_proba: True -> dùng softmax prob; False -> dùng logit
-
-    Trả về (auc_del, auc_ins)
-    """
-    model = explainer.model
+    device = x.device
     model.eval()
-    device = next(model.parameters()).device
-    x = x.to(device)
-    target_cls = target_cls.to(device)
 
-    # 1) lấy importance map
-    with torch.no_grad():
-        token_scores, _ = explainer.attribute(x, target=target_cls, img_size=None)
-        # token_scores: [1,N_patches]
     scores = token_scores[0]  # [N]
-
-    # ranking patch theo độ quan trọng giảm dần
     order = torch.argsort(scores, descending=True)  # [N]
     N = order.numel()
     if steps is None:
         steps = N
     step_size = max(1, N // steps)
 
-    # 2) logit hoặc prob gốc
+    # logit / prob gốc
     with torch.no_grad():
         logits = model(x)  # [1,C]
-    if use_proba:
-        probs = logits.softmax(dim=-1)
-        base_val = probs[0, target_cls.item()]
-    else:
-        base_val = logits[0, target_cls.item()]
+        if use_proba:
+            base_val = logits.softmax(dim=-1)[0, target_cls.item()]
+        else:
+            base_val = logits[0, target_cls.item()]
 
-    # baseline all-zero
     baseline = torch.zeros_like(x)
 
-    # ------- Deletion: start from x, progressively x -> baseline -------
+    # ----- Deletion -----
     x_del = x.clone()
     del_vals = []
 
@@ -458,13 +439,12 @@ def compute_del_ins_auc_single(
             patch_ids = order[i : min(i + step_size, N)]
             x_del = apply_patches(x_del, baseline, patch_ids, model, mode="delete")
 
-    del_vals = torch.tensor(del_vals, device=device)  # [T]
-    # chuẩn hoá curve: start=1, end=0
+    del_vals = torch.tensor(del_vals, device=device)
     del_norm = (del_vals - del_vals[-1]) / (del_vals[0] - del_vals[-1] + eps)
     xs = torch.linspace(0, 1, del_norm.numel(), device=device)
     auc_del = torch.trapz(del_norm, xs).item()
 
-    # ------- Insertion: start from baseline, progressively baseline -> x -------
+    # ----- Insertion -----
     x_ins = baseline.clone()
     ins_vals = []
 

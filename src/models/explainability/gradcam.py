@@ -3,120 +3,96 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 
-def tokens_to_heatmap(
-    token_scores: torch.Tensor,
-    grid_hw: Optional[Tuple[int, int]],
-    img_size: Optional[Tuple[int, int]] = None,
-    eps: float = 1e-6,
-) -> torch.Tensor:
+from .linear_rollout import tokens_to_heatmap
+
+class ViTGradCAM:
     """
-    token_scores: [B, N_patches] (không gồm cls)
-    grid_hw: (H_p, W_p) hoặc None
-    return: [B, 1, H_img, W_img]
+    Grad-CAM adapted cho ViT: hook tại model.norm output [B,N,C].
     """
-    B, num_patches = token_scores.shape
-
-    if grid_hw is not None:
-        H_p, W_p = grid_hw
-    else:
-        side = int(num_patches ** 0.5)
-        H_p, W_p = side, side
-
-    assert H_p * W_p == num_patches, "Số patch không khớp grid_size."
-
-    maps = token_scores.reshape(B, 1, H_p, W_p)
-
-    # chuẩn hoá 0–1
-    maps = maps - maps.amin(dim=(2, 3), keepdim=True)
-    maps = maps / (maps.amax(dim=(2, 3), keepdim=True) + eps)
-
-    if img_size is not None:
-        H_img, W_img = img_size
-    else:
-        # mặc định: mỗi patch 16×16 (vit_small_patch16_224)
-        H_img, W_img = H_p * 16, W_p * 16
-
-    maps_up = F.interpolate(
-        maps, size=(H_img, W_img), mode="bilinear", align_corners=False
-    )
-    return maps_up
-
-class ViTGradCAM(nn.Module):
-    def __init__(self, model: nn.Module, has_cls: bool = True, eps: float = 1e-6):
-        super().__init__()
+    def __init__(
+        self,
+        model: nn.Module,
+        has_cls: bool = True,
+        eps: float = 1e-6,
+    ):
         self.model = model
+        self.model.eval()
         self.has_cls = has_cls
         self.eps = eps
 
-        self.blocks: List[nn.Module] = list(getattr(model, "blocks"))
-        self.grid_hw: Optional[Tuple[int, int]] = getattr(
-            getattr(model, "patch_embed", None), "grid_size", None
-        )
+        self.feats: Optional[torch.Tensor] = None
+        self.grads: Optional[torch.Tensor] = None
 
-        self.activations: Optional[torch.Tensor] = None
-        self.gradients: Optional[torch.Tensor] = None
+        norm_module = getattr(self.model, "norm", None)
+        if norm_module is None:
+            raise RuntimeError("Model không có thuộc tính 'norm' để hook GradCAM.")
 
-        last_block = self.blocks[-1]
+        def fwd_hook(module, inp, out):
+            self.feats = out  # [B,N,C]
 
-        def f_hook(module, inp, out):
-            self.activations = out  # [B, N, C]
+        def bwd_hook(module, grad_input, grad_output):
+            # grad_output[0] tương ứng với grad wrt out
+            self.grads = grad_output[0]  # [B,N,C]
 
-        def b_hook(module, grad_in, grad_out):
-            self.gradients = grad_out[0]  # [B, N, C]
+        self.handle_fwd = norm_module.register_forward_hook(fwd_hook)
+        self.handle_bwd = norm_module.register_full_backward_hook(bwd_hook)
 
-        last_block.register_forward_hook(f_hook)
-        last_block.register_full_backward_hook(b_hook)
+    def __del__(self):
+        # cleanup hook nếu object bị gc
+        try:
+            self.handle_fwd.remove()
+            self.handle_bwd.remove()
+        except Exception:
+            pass
 
     def attribute(
         self,
         x: torch.Tensor,
         target: Optional[torch.Tensor] = None,
-        img_size: Optional[Tuple[int, int]] = None,
-    ):
-        self.model.eval()
+        use_logits: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = x.device
         self.model.zero_grad(set_to_none=True)
+        self.feats = None
+        self.grads = None
 
-        x = x.to(next(self.model.parameters()).device)
-        logits = self.model(x)  # [B, C]
-        B, C = logits.shape
-
+        logits = self.model(x)  # forward; feats đã được lưu trong hook
         if target is None:
             target = logits.argmax(dim=-1)
+
+        one_hot = torch.zeros_like(logits).to(device)
+        one_hot.scatter_(1, target.view(-1, 1), 1.0)
+
+        if use_logits:
+            out = (logits * one_hot).sum()
         else:
-            target = target.to(logits.device)
+            probs = logits.softmax(dim=-1)
+            out = (probs * one_hot).sum()
 
-        idx = torch.arange(B, device=logits.device)
-        logit_target = logits[idx, target]
+        out.backward(retain_graph=False)
 
-        logit_target.sum().backward()
+        if self.feats is None or self.grads is None:
+            raise RuntimeError("Không thu được features / grads trong GradCAM.")
 
-        A = self.activations  # [B, N, C]
-        G = self.gradients    # [B, N, C]
+        feats = self.feats  # [B,N,C]
+        grads = self.grads  # [B,N,C]
 
-        if A is None or G is None:
-            raise RuntimeError("Hooks của GradCAM chưa được kích hoạt.")
+        # alpha_k = mean grad trên tokens
+        # [B,C]
+        alpha = grads.mean(dim=1)
 
-        # trọng số kênh: mean gradient trên tokens
-        # w: [B, C]
-        w = G.mean(dim=1)
+        # CAM_i = ReLU( sum_k alpha_k * feat_{i,k} )
+        cam_tok = torch.einsum("bk,bnk->bn", alpha, feats)  # [B,N]
+        cam_tok = cam_tok.clamp_min(0.0)
 
-        # CAM per token: Σ_k w_k * A_{j,k}
-        # [B, N]
-        cam = (A * w.unsqueeze(1)).sum(dim=-1)
-        cam = F.relu(cam)
-
-        # bỏ cls token nếu có
         if self.has_cls:
-            token_scores = cam[:, 1:]
+            patch_rel = cam_tok[:, 1:]  # bỏ CLS
         else:
-            token_scores = cam
+            patch_rel = cam_tok
 
-        # chuẩn hoá mỗi mẫu
-        token_scores = token_scores - token_scores.amin(dim=1, keepdim=True)
-        token_scores = token_scores / (
-            token_scores.amax(dim=1, keepdim=True) + self.eps
-        )
+        # chuẩn hoá
+        patch_rel = patch_rel / (patch_rel.amax(dim=-1, keepdim=True) + self.eps)
 
-        heatmap = tokens_to_heatmap(token_scores, self.grid_hw, img_size, self.eps)
-        return token_scores, heatmap
+        heatmap = tokens_to_heatmap(patch_rel, self.model, normalize=True)
+        return patch_rel, heatmap
     

@@ -1,219 +1,151 @@
-from typing import List, Optional, Tuple
+from ..linear_vit import LinearMultiheadAttention
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class LARollout(nn.Module):
-    def __init__(self, 
-                 model: nn.Module, 
-                 has_cls: bool = True, 
-                 use_abs_grad: bool = True,
-                 clamp_grad_pos: bool = True,
-                 eps: float = 1e-6
-                 ):
-        super().__init__()
+from typing import List, Optional, Tuple
+
+def set_linear_attn_record(model: nn.Module, record: bool = True):
+    for m in model.modules():
+        if isinstance(m, LinearMultiheadAttention):
+            m.record_attn = record
+            m.attn_map = None
+
+def tokens_to_heatmap(
+    patch_rel: torch.Tensor,  # [B, N_patches]
+    model: nn.Module,
+    normalize: bool = True,
+) -> torch.Tensor:
+    """
+    Chuyển relevance patch-level → heatmap [B, 1, H, W] (align với ảnh input).
+    """
+    pe = getattr(model, "patch_embed", None)
+    if pe is None or getattr(pe, "grid_size", None) is None:
+        raise RuntimeError("model.patch_embed.grid_size không tồn tại.")
+
+    Hp, Wp = pe.grid_size  # số patch theo chiều H, W
+    B, Np = patch_rel.shape
+    assert Np == Hp * Wp, f"Mismatch N_patches={Np}, Hp*Wp={Hp*Wp}"
+
+    # [B, 1, Hp, Wp]
+    attn_map = patch_rel.view(B, 1, Hp, Wp)
+
+    # Lấy kích thước ảnh
+    img_size = getattr(model, "img_size", None)
+    if img_size is None:
+        ps = getattr(pe, "patch_size", None)
+        if isinstance(ps, (tuple, list)):
+            ps_h, ps_w = ps
+        else:
+            ps_h = ps_w = int(ps)
+        H = Hp * ps_h
+        W = Wp * ps_w
+    else:
+        if isinstance(img_size, (tuple, list)):
+            H, W = img_size
+        else:
+            H = W = int(img_size)
+
+    heatmap = F.interpolate(
+        attn_map,
+        size=(H, W),
+        mode="bilinear",
+        align_corners=False,
+    )  # [B,1,H,W]
+
+    if normalize:
+        heatmap = heatmap - heatmap.amin(dim=(1, 2, 3), keepdim=True)
+        heatmap = heatmap / (heatmap.amax(dim=(1, 2, 3), keepdim=True) + 1e-6)
+
+    return heatmap  # [B,1,H,W]
+
+class LAGRA:
+    def __init__(
+        self,
+        model: nn.Module,
+        has_cls: bool = True,
+        blocks_attr: str = "blocks",
+        eps: float = 1e-6
+    ):
         self.model = model
-        self.blocks: List[nn.Module] = list(getattr(model, "blocks"))
+        self.model.eval()
+        self.blocks: List[nn.Module] = list(getattr(model, blocks_attr))
         self.has_cls = has_cls
         self.eps = eps
 
-        self.use_abs_grad = use_abs_grad
-        self.clamp_grad_pos = clamp_grad_pos
+    def _enable_record_attn(self, flag: bool):
+        set_linear_attn_record(self.model, record=flag)
 
-        self.grid_hw: Optional[Tuple[int, int]] = getattr(
-            getattr(model, "patch_embed", None), "grid_size", None
-        )
-
-    def _tokens_to_heatmap(
-        self,
-        token_scores: torch.Tensor,
-        img_size: Optional[Tuple[int, int]] = None
-    ):
-        B, num_patches = token_scores.shape
-        if self.grid_hw is not None:
-            H_p, W_p = self.grid_hw
-        else:
-            side = int(num_patches ** 0.5)
-            H_p, W_p = side, side
-
-        assert H_p * W_p == num_patches, "Số patch không khớp grid_size."
-        
-        maps = token_scores.reshape(B, 1, H_p, W_p)
-        maps = maps - maps.amin(dim=(2, 3), keepdim=True)
-        maps = maps / (maps.amax(dim=(2, 3), keepdim=True) + self.eps)
-
-        if img_size is not None:
-            H_img, W_img = img_size
-        else:
-            H_img, W_img = H_p * 16, W_p * 16
-
-        maps_up = F.interpolate(
-            maps, size=(H_img, W_img), mode="bilinear", align_corners=False
-        )
-        return maps_up
-    
-    def _collect_attn_and_grads(self):
-        attn_maps = []
-        attn_grads = []
-
-        for blk in self.blocks:
-            attn_mod = getattr(blk, "attn", None)
-            if attn_mod is None:
-                raise RuntimeError("Block không có thuộc tính 'attn'.")
-
-            attn = getattr(attn_mod, "attn_map", None)
-            if attn is None:
-                raise RuntimeError(
-                    "block.attn.attn_map is None. "
-                    "Hãy đảm bảo LinearMultiheadAttention lưu self.attn_map trong forward."
-                )
-
-            if attn.grad is None:
-                raise RuntimeError(
-                    "attn_map.grad is None. "
-                    "Bạn phải gọi backward() trên logit target trước khi explain, "
-                    "và trong forward cần gọi self.attn_map.retain_grad()."
-                )
-
-            attn_maps.append(attn.detach())       # [B, H, N, N]
-            attn_grads.append(attn.grad.detach()) # [B, H, N, N]
-
-        return attn_maps, attn_grads
-    
-    def _compute_head_weights(
-        self,
-        attn_grads: List[torch.Tensor],
-        cls_index: int = 0,
-    ):
-        layer_head_weights: List[torch.Tensor] = []
-
-        for grad in attn_grads:
-            # grad: [B, H, N, N]
-            B, H, N, _ = grad.shape
-
-            # lấy hàng i = cls_index
-            grad_cls = grad[:, :, cls_index, :]  # [B, H, N]
-
-            # nếu có class token, bỏ cột đầu tương ứng class
-            if self.has_cls:
-                grad_cls = grad_cls[..., 1:]     # [B, H, N-1]
-
-            # xử lý gradient theo config
-            if self.clamp_grad_pos:
-                grad_cls = F.relu(grad_cls)
-            if self.use_abs_grad:
-                grad_cls = grad_cls.abs()
-
-            # tổng trên patch, rồi trung bình trên batch → [H]
-            g_h = grad_cls.sum(dim=-1).mean(dim=0)  # [H]
-
-            g_h = g_h + self.eps
-            alpha_h = g_h / g_h.sum()
-            layer_head_weights.append(alpha_h)      # [H]
-
-        return layer_head_weights
-    
-    def _build_rollout_matrix(
-        self,
-        attn_maps: List[torch.Tensor],
-        head_weights: List[torch.Tensor],
-        cls_index: int = 0,
-    ) -> torch.Tensor:
-        # khởi tạo rollout là identity
-        B, H, N, _ = attn_maps[0].shape
-        device = attn_maps[0].device
-
-        A_rollout = torch.eye(N, device=device).unsqueeze(0).repeat(B, 1, 1)  # [B, N, N]
-
-        for A_l, alpha_h in zip(attn_maps, head_weights):
-            # A_l: [B, H, N, N], alpha_h: [H]
-            alpha = alpha_h.view(1, -1, 1, 1)        # [1, H, 1, 1]
-            A_combo = (A_l * alpha).sum(dim=1)       # [B, N, N]
-
-            # cộng residual
-            I = torch.eye(N, device=A_combo.device).unsqueeze(0)  # [1, N, N]
-            A_tilde = A_combo + I                                # [B, N, N]
-
-            # rollout
-            A_rollout = torch.bmm(A_rollout, A_tilde)            # [B, N, N]
-
-        return A_rollout
-    
     def attribute(
         self,
         x: torch.Tensor,
         target: Optional[torch.Tensor] = None,
-        img_size: Optional[Tuple[int, int]] = None,
-        return_rollout: bool = False,
-    ):
-        """
-        Tính giải thích LAGR cho batch ảnh x.
-
-        Args:
-            x: Tensor [B, 3, H, W]
-            target:
-                - None: dùng argmax(logits) cho mỗi mẫu
-                - Tensor [B]: index class mục tiêu cho từng mẫu
-            img_size:
-                - None: suy ra từ grid_size * 16
-                - (H_img, W_img): kích thước muốn upsample heatmap
-            return_rollout:
-                - False (default): chỉ trả về token_scores và heatmap
-                - True: trả thêm A_rollout [B, N, N]
-
-        Returns:
-            Nếu return_rollout == False:
-                token_scores: [B, N-1]
-                    - độ quan trọng của từng patch token (bỏ class token)
-                heatmap: [B, 1, H_img, W_img]
-                    - bản đồ nhiệt đã upsample theo kích thước ảnh
-
-            Nếu return_rollout == True:
-                token_scores: [B, N-1]
-                heatmap: [B, 1, H_img, W_img]
-                A_rollout: [B, N, N]
-                    - ma trận rollout full token→token (class row vs mọi token)
-        """
-
-        self.model.eval()
-
-        for blk in self.blocks:
-            attn_mod = getattr(blk, "attn", None)
-            if attn_mod is not None and hasattr(attn_mod, "record_attn"):
-                attn_mod.record_attn = True
-
+        use_logits: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        device = x.device
         self.model.zero_grad(set_to_none=True)
-        x = x.to(next(self.model.parameters()).device)
+        self._enable_record_attn(True)
 
-        logits = self.model(x)   # [B, num_classes]
-        B, C = logits.shape
-
+        logits = self.model(x)  # [B,C]
         if target is None:
             target = logits.argmax(dim=-1)  # [B]
+
+        one_hot = torch.zeros_like(logits).to(device)
+        one_hot.scatter_(1, target.view(-1, 1), 1.0)
+        
+        if use_logits:
+            out = (logits * one_hot).sum()
         else:
-            target = target.to(logits.device)
+            probs = logits.softmax(dim=-1)
+            out = (probs * one_hot).sum()
 
-        idx = torch.arange(B, device=logits.device)
-        logit_target = logits[idx, target]  # [B]
+        self.model.zero_grad(set_to_none=True)
+        out.backward(retain_graph=False)
 
-        logit_target.sum().backward()
-        attn_maps, attn_grads = self._collect_attn_and_grads()
+        R_all = None
+        for blk in self.blocks:
+            attn_layer = getattr(blk, "attn", None)
+            if not isinstance(attn_layer, LinearMultiheadAttention):
+                continue
+            attn = attn_layer.attn_map
+            if attn is None:
+                continue
+            grad = attn_layer.attn_map.grad
+            if grad is None:
+                continue
 
-        head_weights = self._compute_head_weights(attn_grads, cls_index=0)
-        A_rollout = self._build_rollout_matrix(attn_maps, head_weights, cls_index=0)
-        cls_row = A_rollout[:, 0, :]
+            joint = (attn * grad).clamp_min(0.0)  # [B,H,N,N]
+            joint = joint.mean(dim=1)             # [B,N,N]
+
+            joint_sum = joint.sum(dim=-1, keepdim=True) + self.eps
+            joint = joint / joint_sum
+
+            B_, N, _ = joint.shape
+            eye = torch.eye(N, device=device).unsqueeze(0).expand(B_, -1, -1)
+            joint = joint + eye
+            joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
+
+            if R_all is None:
+                R_all = joint
+            else:
+                R_all = torch.bmm(R_all, joint)
+
+        self._enable_record_attn(False)
+        self.model.zero_grad(set_to_none=True)
+
+        if R_all is None:
+            raise RuntimeError("Không thu được attn_map nào trong LAAttributor.")
 
         if self.has_cls:
-            token_scores = cls_row[:, 1:]
+            cls_idx = 0
+            token_rel = R_all[:, cls_idx, :]  # [B,N]
+            patch_rel = token_rel[:, 1:]      # [B,N_p]
         else:
-            token_scores = cls_row
+            patch_rel = R_all.mean(dim=1)
 
-        token_scores = token_scores - token_scores.amin(dim=1, keepdim=True)
-        token_scores = token_scores / (token_scores.amax(dim=1, keepdim=True) + self.eps)
+        patch_rel = patch_rel.clamp_min(0.0)
+        patch_rel = patch_rel / (patch_rel.amax(dim=-1, keepdim=True) + self.eps)
 
-        heatmap = self._tokens_to_heatmap(token_scores, img_size=img_size)
-
-        if return_rollout:
-            return token_scores, heatmap, A_rollout
-        else:
-            return token_scores, heatmap
+        heatmap = tokens_to_heatmap(patch_rel, self.model, normalize=True)
+        return patch_rel, heatmap
+    

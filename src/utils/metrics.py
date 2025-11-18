@@ -290,301 +290,420 @@ def get_memory_usage() -> float:
         else:
             return 0.0  # Unable to get memory info
 
-def get_item_from_dataset(ds, idx):
-    s = ds[idx]
-    img, y = None, None
-    if isinstance(s, (tuple, list)):
-        img = s[0]
-        if len(s) > 1:
-            y = s[1]
-    elif isinstance(s, dict):
-        for k in ("image", "img", "tensor", "x"):
-            if k in s:
-                img = s[k]
-                break
-        for k in ("label", "y", "target"):
-            if k in s:
-                y = s[k]
-                break
+def get_patch_grid(model) -> Tuple[int, int]:
+    pe = getattr(model, "patch_embed", None)
+    if pe is None or getattr(pe, "grid_size", None) is None:
+        raise RuntimeError("Model không có patch_embed.grid_size.")
+    Hp, Wp = pe.grid_size
+    return int(Hp), int(Wp)
+
+def compute_entropy_and_gini(
+    patch_rel: torch.Tensor,
+    eps: float = 1e-8,
+) -> Tuple[float, float]:
+    """
+    patch_rel: [N_patches], không nhất thiết chuẩn hoá.
+    Trả về:
+        entropy (natural log, normalized bởi log N),
+        gini (1 - sum p^2).
+    """
+    # đảm bảo không âm
+    scores = patch_rel.clone().detach().float()
+    scores = scores.clamp_min(0.0)
+
+    ssum = scores.sum()
+    if ssum <= 0:
+        # nếu tất cả 0, coi như phân bố đều
+        N = scores.numel()
+        p = torch.full_like(scores, 1.0 / N)
     else:
-        img = s
-    if not torch.is_tensor(img):
-        raise TypeError("Dataset phải trả về ảnh dạng torch.Tensor sau transform.")
-    if y is not None and not torch.is_tensor(y):
-        y = torch.tensor(y)
-    return img, y
+        p = scores / ssum  # phân bố xác suất
 
-def to_device_batch(x, y, device):
-    x = x.unsqueeze(0).to(device, non_blocking=True)  # [1,3,H,W]
-    y = None if y is None else y.view(-1).to(device)
-    return x, y
-
-def get_patch_grid_and_size(model: nn.Module, x: torch.Tensor) -> Tuple[int,int,int,int]:
-    """
-    Trả về (H_p, W_p, patch_h, patch_w)
-    H_p,W_p: lưới patch
-    patch_h,patch_w: kích thước mỗi patch trên ảnh
-    """
-    grid_hw = getattr(getattr(model, "patch_embed", None), "grid_size", None)
-    B, C, H, W = x.shape
-    if grid_hw is not None:
-        H_p, W_p = grid_hw
-    else:
-        # fallback: assume square
-        side = int((H * W) ** 0.5)
-        H_p = W_p = H // 16
-    patch_h = H // H_p
-    patch_w = W // W_p
-    return H_p, W_p, patch_h, patch_w
-
-def apply_patches(
-    base: torch.Tensor,
-    src: torch.Tensor,
-    patch_indices: torch.Tensor,
-    model: nn.Module,
-    mode: str = "insert",
-):
-    """
-    base, src: [1,3,H,W]
-    patch_indices: 1D tensor of patch ids (0..N_p-1)
-    mode:
-        - 'insert': copy patch từ src -> base
-        - 'delete': set patch ở base = 0
-    """
-    assert base.shape == src.shape and base.shape[0] == 1
-    device = base.device
-
-    H_p, W_p, patch_h, patch_w = get_patch_grid_and_size(model, base)
-    x_out = base.clone()
-
-    for idx in patch_indices.tolist():
-        i = idx // W_p
-        j = idx % W_p
-        h0, h1 = i * patch_h, (i + 1) * patch_h
-        w0, w1 = j * patch_w, (j + 1) * patch_w
-
-        if mode == "insert":
-            x_out[:, :, h0:h1, w0:w1] = src[:, :, h0:h1, w0:w1]
-        elif mode == "delete":
-            x_out[:, :, h0:h1, w0:w1] = 0.0
-        else:
-            raise ValueError(f"Unknown mode: {mode}")
-    return x_out
-
-def entropy_gini_from_tokens(token_scores: torch.Tensor, eps: float = 1e-6):
-    """
-    token_scores: [N] hoặc [1,N]; không cần chuẩn hoá trước.
-    Trả về (entropy_norm, gini), đều là scalar float.
-    """
-    if token_scores.dim() == 2:
-        token_scores = token_scores[0]
-    # đảm bảo dương và chuẩn hoá thành phân phối
-    scores = torch.clamp(token_scores, min=0)
-    s_sum = scores.sum() + eps
-    p = scores / s_sum      # [N]
+    # entropy
+    logp = torch.log(p + eps)
+    ent = -(p * logp).sum().item()
     N = p.numel()
+    # chuẩn hoá về [0,1]
+    ent_norm = ent / (np.log(N) + eps)
 
-    # entropy chuẩn hoá 0..1
-    entropy = -(p * (p + eps).log()).sum()
-    entropy_norm = (entropy / math.log(N + eps)).item()
+    # gini (1 - sum p^2)
+    gini = 1.0 - (p * p).sum().item()
+    return float(ent_norm), float(gini)
 
-    # Gini với sum(p)=1: G = 1 - Σ p_i^2
-    gini = (1.0 - (p * p).sum()).item()
-    return entropy_norm, gini
+def auc_trapezoid(xs: np.ndarray, ys: np.ndarray) -> float:
+    """
+    xs: [T], monotonically increasing (0→1)
+    ys: [T], giá trị score đã normalize (0→1)
+    """
+    return float(np.trapz(ys, xs))
 
-def compute_del_ins_auc_single(
-    model: nn.Module,
-    x: torch.Tensor,
-    target_cls: torch.Tensor,
-    token_scores: torch.Tensor,
-    steps: Optional[int] = None,
-    use_proba: bool = False,
-    eps: float = 1e-6,
-):
+def apply_patch_mask_to_image(
+    x: torch.Tensor,           # [B,3,H,W]
+    patch_mask: torch.Tensor,  # [B,1,Hp,Wp], 1 = giữ input, 0 = baseline
+    baseline: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Up-sample patch_mask lên H×W và trộn với baseline.
+    """
+    B, C, H, W = x.shape
+    _, _, Hp, Wp = patch_mask.shape
+    if baseline is None:
+        baseline = torch.zeros_like(x)
+
+    mask_up = F.interpolate(
+        patch_mask,
+        size=(H, W),
+        mode="nearest",
+    )  # [B,1,H,W]
+
+    return x * mask_up + baseline * (1.0 - mask_up)
+
+def insertion_deletion_auc_single(
+    model: torch.nn.Module,
+    x: torch.Tensor,                # [1,3,H,W]
+    patch_rel: torch.Tensor,        # [1,N_patches]
+    target: torch.Tensor,           # [1], Long
+    Hp: int,
+    Wp: int,
+    steps: int = 20,
+    baseline: Optional[torch.Tensor] = None,
+    use_logits: bool = True,
+    eps: float = 1e-8,
+) -> Tuple[float, float]:
+    """
+    Tính AUC cho insertion và deletion cho 1 ảnh.
+    Trả về (auc_del, auc_ins).
+    - deletion: bắt đầu từ ảnh gốc, dần dần che các patch quan trọng.
+    - insertion: bắt đầu từ baseline, dần dần thêm các patch quan trọng.
+
+    AUC tính trên score đã normalize về [0,1]:
+      - deletion: chia cho score ban đầu.
+      - insertion: chia cho score cuối.
+    """
     device = x.device
     model.eval()
 
-    scores = token_scores[0]  # [N]
-    order = torch.argsort(scores, descending=True)  # [N]
-    N = order.numel()
-    if steps is None:
-        steps = N
-    step_size = max(1, N // steps)
+    if baseline is None:
+        baseline = torch.zeros_like(x)
 
-    # logit / prob gốc
     with torch.no_grad():
-        logits = model(x)  # [1,C]
-        if use_proba:
-            base_val = logits.softmax(dim=-1)[0, target_cls.item()]
+        logits = model(x)
+        if use_logits:
+            base_score = logits.gather(1, target.view(-1, 1)).squeeze(1)  # [1]
         else:
-            base_val = logits[0, target_cls.item()]
+            probs = logits.softmax(dim=-1)
+            base_score = probs.gather(1, target.view(-1, 1)).squeeze(1)   # [1]
 
-    baseline = torch.zeros_like(x)
+    base_score = base_score.item()
 
-    # ----- Deletion -----
-    x_del = x.clone()
-    del_vals = []
+    scores_del = []
+    scores_ins = []
 
-    with torch.no_grad():
-        for i in range(0, N + 1, step_size):
-            logits_d = model(x_del)
-            if use_proba:
-                v = logits_d.softmax(dim=-1)[0, target_cls.item()]
+    Np = patch_rel.shape[1]
+    # sort patch idx theo importance giảm dần
+    importance = patch_rel[0].detach()
+    idx_sorted = torch.argsort(importance, descending=True)  # [Np]
+
+    step = max(Np // steps, 1)
+    # số bước thực tế
+    num_steps = (Np + step - 1) // step  # ceil
+
+    # -------- Deletion --------
+    for s in range(num_steps + 1):
+        # che s*step patch quan trọng nhất
+        k = s * step
+        k = min(k, Np)
+        # patch_mask = 1 ở patch giữ lại, 0 ở patch masked
+        mask = torch.ones(1, 1, Hp, Wp, device=device)
+        if k > 0:
+            idx_del = idx_sorted[:k]
+            h_del = idx_del // Wp
+            w_del = idx_del % Wp
+            mask[0, 0, h_del, w_del] = 0.0
+
+        x_del = apply_patch_mask_to_image(x, mask, baseline=baseline)  # [1,3,H,W]
+        with torch.no_grad():
+            logits_del = model(x_del)
+            if use_logits:
+                score_del = logits_del.gather(1, target.view(-1, 1)).item()
             else:
-                v = logits_d[0, target_cls.item()]
-            del_vals.append(v.item())
+                probs_del = logits_del.softmax(dim=-1)
+                score_del = probs_del.gather(1, target.view(-1, 1)).item()
+        scores_del.append(score_del)
 
-            if i == N:
-                break
-            patch_ids = order[i : min(i + step_size, N)]
-            x_del = apply_patches(x_del, baseline, patch_ids, model, mode="delete")
+    # normalize deletion scores theo base_score
+    scores_del = np.array(scores_del, dtype=np.float64)
+    if base_score > 0:
+        scores_del_norm = np.clip(scores_del / (base_score + eps), 0.0, 1.0)
+    else:
+        # nếu base_score ~0, coi như không có signal, đặt toàn 0
+        scores_del_norm = np.zeros_like(scores_del)
+    xs_del = np.linspace(0.0, 1.0, num_steps + 1)
+    auc_del = auc_trapezoid(xs_del, scores_del_norm)
 
-    del_vals = torch.tensor(del_vals, device=device)
-    del_norm = (del_vals - del_vals[-1]) / (del_vals[0] - del_vals[-1] + eps)
-    xs = torch.linspace(0, 1, del_norm.numel(), device=device)
-    auc_del = torch.trapz(del_norm, xs).item()
+    # -------- Insertion --------
+    # bắt đầu từ ảnh baseline, dần thêm patch quan trọng
+    scores_ins = []
+    # để biết score cuối (tất cả patch), ta có thể dùng base_score luôn
+    full_score = base_score
 
-    # ----- Insertion -----
-    x_ins = baseline.clone()
-    ins_vals = []
+    for s in range(num_steps + 1):
+        k = s * step
+        k = min(k, Np)
+        mask = torch.zeros(1, 1, Hp, Wp, device=device)
+        if k > 0:
+            idx_ins = idx_sorted[:k]
+            h_ins = idx_ins // Wp
+            w_ins = idx_ins % Wp
+            mask[0, 0, h_ins, w_ins] = 1.0
 
-    with torch.no_grad():
-        for i in range(0, N + 1, step_size):
-            logits_i = model(x_ins)
-            if use_proba:
-                v = logits_i.softmax(dim=-1)[0, target_cls.item()]
+        x_ins = apply_patch_mask_to_image(x, mask, baseline=baseline)
+        with torch.no_grad():
+            logits_ins = model(x_ins)
+            if use_logits:
+                score_ins = logits_ins.gather(1, target.view(-1, 1)).item()
             else:
-                v = logits_i[0, target_cls.item()]
-            ins_vals.append(v.item())
+                probs_ins = logits_ins.softmax(dim=-1)
+                score_ins = probs_ins.gather(1, target.view(-1, 1)).item()
+        scores_ins.append(score_ins)
 
-            if i == N:
-                break
-            patch_ids = order[i : min(i + step_size, N)]
-            x_ins = apply_patches(x_ins, x, patch_ids, model, mode="insert")
-
-    ins_vals = torch.tensor(ins_vals, device=device)
-    ins_norm = (ins_vals - ins_vals[0]) / (ins_vals[-1] - ins_vals[0] + eps)
-    xs = torch.linspace(0, 1, ins_norm.numel(), device=device)
-    auc_ins = torch.trapz(ins_norm, xs).item()
+    scores_ins = np.array(scores_ins, dtype=np.float64)
+    if full_score > 0:
+        scores_ins_norm = np.clip(scores_ins / (full_score + eps), 0.0, 1.0)
+    else:
+        scores_ins_norm = np.zeros_like(scores_ins)
+    xs_ins = np.linspace(0.0, 1.0, num_steps + 1)
+    auc_ins = auc_trapezoid(xs_ins, scores_ins_norm)
 
     return auc_del, auc_ins
 
-def compute_ccs_top2(
-    explainer,
-    x: torch.Tensor,
-    logits: torch.Tensor,
-) -> float:
-    model = explainer.model
-    model.eval()
-    probs, idxs = torch.topk(logits[0], k=min(2, logits.shape[1]))
-    if idxs.numel() < 2:
-        return float("nan")
-    c1, c2 = idxs[0].view(1), idxs[1].view(1)  # [1]
-
-    # class 1
-    model.zero_grad(set_to_none=True)
-    token1, h1 = explainer.attribute(x, target=c1, img_size=None)
-    # class 2
-    model.zero_grad(set_to_none=True)
-    token2, h2 = explainer.attribute(x, target=c2, img_size=None)
-
-    h1 = h1[0, 0].detach().reshape(-1)  # [HW]
-    h2 = h2[0, 0].detach().reshape(-1)
-
-    # chuẩn hoá vector
-    h1 = h1 - h1.mean()
-    h2 = h2 - h2.mean()
-    h1 = h1 / (h1.norm() + 1e-6)
-    h2 = h2 / (h2.norm() + 1e-6)
-
-    cos = float((h1 * h2).sum().item())
-    return cos
-
-def evaluate_methods_on_dataset(
-    methods: Dict[str, nn.Module],
+def evaluate_xai_method_dataset(
+    attributor,
     dataset,
-    device: str,
+    device: str = "cuda",
     use_pred: bool = True,
     max_samples: Optional[int] = None,
-    steps_auc: Optional[int] = None,
-    use_proba_auc: bool = False,
-    compute_ccs: bool = True,
-):
+    steps: int = 20,
+    baseline: Optional[torch.Tensor] = None,
+    use_logits: bool = True,
+    verbose_every: int = 50,
+) -> Dict[str, Any]:
     """
-    methods: tên -> explainer (LAGR, GradCAM, IG, KernelSHAP, Occlusion, Rollout)
-    dataset: test_dataset
-    use_pred:
-        True  -> target = class dự đoán
-        False -> nếu dataset có label thì dùng label
+    Đánh giá một XAI method trên dataset.
+
+    attributor: object có .attribute(x, target, use_logits) -> (patch_rel, heatmap)
+                và thuộc tính .model
+    dataset: torch Dataset trả (img, label, ...) hoặc (img, label)
+
+    Trả về dict:
+        {
+          "auc_del_mean": ...,
+          "auc_ins_mean": ...,
+          "entropy_mean": ...,
+          "gini_mean": ...,
+          "n_samples": N
+        }
     """
-    device_t = torch.device(device)
+    model = attributor.model
+    model.eval()
+    Hp, Wp = get_patch_grid(model)
 
-    first_explainer = next(iter(methods.values()))
-    backbone = first_explainer.model.to(device_t).eval()
+    auc_del_list = []
+    auc_ins_list = []
+    ent_list = []
+    gini_list = []
 
-    n = len(dataset) if max_samples is None else min(max_samples, len(dataset))
+    n_total = len(dataset)
+    if max_samples is not None:
+        n_total = min(n_total, max_samples)
 
-    metrics = {
-        name: defaultdict(list)
-        for name in methods.keys()
-    }
+    for idx in range(n_total):
+        sample = dataset[idx]
+        if isinstance(sample, (tuple, list)):
+            img = sample[0]
+            label = sample[1]
+        else:
+            img = sample
+            label = None
 
-    for idx in tqdm(range(n), desc="Evaluating XAI methods"):
-        img_t, y = get_item_from_dataset(dataset, idx)
-        x, y = to_device_batch(img_t, y, device_t)
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        if img.ndim == 4:
+            img = img[0]
+        img = img.to(device).unsqueeze(0)  # [1,3,H,W]
 
-        with torch.no_grad():
-            logits = backbone(x)          # [1,C]
-            pred_cls = logits.argmax(dim=1)
+        if isinstance(label, torch.Tensor):
+            label = int(label.item())
+        elif label is not None:
+            label = int(label)
 
-        target_cls = pred_cls if (use_pred or y is None) else y
+        # quyết định target class
+        if use_pred or label is None:
+            with torch.no_grad():
+                logits = model(img)
+                target_cls = int(logits.argmax(dim=-1).item())
+        else:
+            target_cls = label
 
-        for name, explainer in methods.items():
-            explainer.model.to(device_t).eval()
+        target_tensor = torch.tensor([target_cls], device=device, dtype=torch.long)
 
-            # 1) token_scores cho entropy/gini + AUC
-            explainer.model.zero_grad(set_to_none=True)
-            token_scores, _ = explainer.attribute(
-                x, target=target_cls, img_size=None
-            )  # [1,N], [1,1,H,W]
-            token_scores_det = token_scores.detach()
+        # gọi attributor
+        patch_rel, _ = attributor.attribute(img, target=target_tensor, use_logits=use_logits)
+        # patch_rel: [1,N_p]
+        patch_rel_1d = patch_rel[0]
 
-            entropy, gini = entropy_gini_from_tokens(token_scores_det[0])
+        # sparsity metrics
+        ent, gini = compute_entropy_and_gini(patch_rel_1d)
+        ent_list.append(ent)
+        gini_list.append(gini)
 
-            auc_del, auc_ins = compute_del_ins_auc_single(
-                model=explainer.model,
-                x=x,
-                target_cls=target_cls,
-                token_scores=token_scores_det,
-                steps=steps_auc,
-                use_proba=use_proba_auc,
+        # insertion/deletion AUC
+        auc_del, auc_ins = insertion_deletion_auc_single(
+            model=model,
+            x=img,
+            patch_rel=patch_rel,
+            target=target_tensor,
+            Hp=Hp,
+            Wp=Wp,
+            steps=steps,
+            baseline=baseline,
+            use_logits=use_logits,
+        )
+        auc_del_list.append(auc_del)
+        auc_ins_list.append(auc_ins)
+
+        if verbose_every and (idx + 1) % verbose_every == 0:
+            print(
+                f"[{idx+1}/{n_total}] "
+                f"AUC_del_mean={np.mean(auc_del_list):.4f}, "
+                f"AUC_ins_mean={np.mean(auc_ins_list):.4f}, "
+                f"entropy_mean={np.mean(ent_list):.4f}"
             )
 
-            metrics[name]["auc_del"].append(auc_del)
-            metrics[name]["auc_ins"].append(auc_ins)
-            metrics[name]["entropy"].append(entropy)
-            metrics[name]["gini"].append(gini)
+    result = {
+        "auc_del_mean": float(np.mean(auc_del_list)) if auc_del_list else 0.0,
+        "auc_ins_mean": float(np.mean(auc_ins_list)) if auc_ins_list else 0.0,
+        "entropy_mean": float(np.mean(ent_list)) if ent_list else 0.0,
+        "gini_mean": float(np.mean(gini_list)) if gini_list else 0.0,
+        "n_samples": len(auc_del_list),
+    }
+    return result
 
-            # 2) CCS: cosine giữa heatmap class1 và class2
-            if compute_ccs:
-                ccs = compute_ccs_top2(explainer, x, logits)
-                if not math.isnan(ccs):
-                    metrics[name]["ccs"].append(ccs)
+def cosine_similarity_heatmaps(
+    hm1: torch.Tensor,   # [1,1,H,W]
+    hm2: torch.Tensor,   # [1,1,H,W]
+    eps: float = 1e-8,
+) -> float:
+    v1 = hm1.view(-1).float()
+    v2 = hm2.view(-1).float()
 
-    # tổng hợp
-    out = {}
-    for name, vals in metrics.items():
-        m = {}
-        if len(vals["auc_del"]) > 0:
-            m["auc_del_mean"] = float(sum(vals["auc_del"]) / len(vals["auc_del"]))
-            m["auc_ins_mean"] = float(sum(vals["auc_ins"]) / len(vals["auc_ins"]))
-            m["entropy_mean"] = float(sum(vals["entropy"]) / len(vals["entropy"]))
-            m["gini_mean"] = float(sum(vals["gini"]) / len(vals["gini"]))
-            if compute_ccs and len(vals["ccs"]) > 0:
-                m["ccs_mean"] = float(sum(vals["ccs"]) / len(vals["ccs"]))
-            else:
-                m["ccs_mean"] = None
-            m["n_samples"] = len(vals["auc_del"])
-        out[name] = m
+    v1 = v1 - v1.mean()
+    v2 = v2 - v2.mean()
 
-    return out
+    n1 = torch.norm(v1)
+    n2 = torch.norm(v2)
+    if n1 < eps or n2 < eps:
+        return 0.0
+
+    cos = torch.dot(v1, v2) / (n1 * n2 + eps)
+    return float(cos.item())
+
+def evaluate_class_specificity_cosine(
+    attributor,
+    dataset,
+    device: str = "cuda",
+    max_samples: Optional[int] = None,
+    use_logits: bool = True,
+    use_pred: bool = True,
+    verbose_every: int = 50,
+) -> Dict[str, Any]:
+    """
+    Đánh giá class-specificity:
+      - Với mỗi sample, lấy heatmap cho positive class (label hoặc predicted).
+      - Lấy heatmap cho negative class (top-2 logit khác positive).
+      - Tính cosine similarity giữa 2 heatmaps (flatten).
+    Trả về:
+      {
+        "cosine_cs_mean": ...,
+        "cosine_cs_std": ...,
+        "n_samples": N
+      }
+    """
+    model = attributor.model
+    model.eval()
+
+    cos_list = []
+
+    n_total = len(dataset)
+    if max_samples is not None:
+        n_total = min(n_total, max_samples)
+
+    for idx in range(n_total):
+        sample = dataset[idx]
+        if isinstance(sample, (tuple, list)):
+            img = sample[0]
+            label = sample[1]
+        else:
+            img = sample
+            label = None
+
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img)
+        if img.ndim == 4:
+            img = img[0]
+        img = img.to(device).unsqueeze(0)  # [1,3,H,W]
+
+        if isinstance(label, torch.Tensor):
+            label = int(label.item())
+        elif label is not None:
+            label = int(label)
+
+        # forward để lấy logits
+        with torch.no_grad():
+            logits = model(img)
+            probs = logits.softmax(dim=-1)
+            preds_sorted = torch.argsort(probs, dim=-1, descending=True)  # [1,num_classes]
+
+        # quyết định positive class
+        if use_pred or label is None:
+            pos_cls = int(preds_sorted[0, 0].item())
+        else:
+            pos_cls = label
+
+        # chọn negative class: lớp có prob cao nhưng ≠ pos_cls
+        neg_cls = None
+        for j in range(preds_sorted.shape[1]):
+            c = int(preds_sorted[0, j].item())
+            if c != pos_cls:
+                neg_cls = c
+                break
+        if neg_cls is None:
+            # trường hợp hiếm (1 class), bỏ qua
+            continue
+
+        pos_t = torch.tensor([pos_cls], device=device, dtype=torch.long)
+        neg_t = torch.tensor([neg_cls], device=device, dtype=torch.long)
+
+        # Heatmap cho positive class
+        _, hm_pos = attributor.attribute(img, target=pos_t, use_logits=use_logits)
+        # Heatmap cho negative class
+        _, hm_neg = attributor.attribute(img, target=neg_t, use_logits=use_logits)
+
+        # [1,1,H,W] -> tính cosine
+        cos_val = cosine_similarity_heatmaps(hm_pos[0:1], hm_neg[0:1])
+        cos_list.append(cos_val)
+
+        if verbose_every and (idx + 1) % verbose_every == 0:
+            print(f"[{idx+1}/{n_total}] cosine_cs_mean={np.mean(cos_list):.4f}")
+
+    if len(cos_list) == 0:
+        return {"cosine_cs_mean": 0.0, "cosine_cs_std": 0.0, "n_samples": 0}
+
+    cos_arr = np.array(cos_list, dtype=np.float64)
+    result = {
+        "cosine_cs_mean": float(cos_arr.mean()),
+        "cosine_cs_std": float(cos_arr.std()),
+        "n_samples": len(cos_list),
+    }
+    return result
+

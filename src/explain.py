@@ -1,154 +1,149 @@
 import torch
-import torch.nn.functional as F
-from matplotlib import cm
 import matplotlib.pyplot as plt
-from collections import OrderedDict
 import numpy as np
-import math
 
-def _get_item(ds, idx):
-    s = ds[idx]
-    img, y = None, None
-    if isinstance(s, (tuple, list)):
-        img = s[0]
-        if len(s) > 1:
-            y = s[1]
-    elif isinstance(s, dict):
-        for k in ("image", "img", "tensor", "x"):
-            if k in s:
-                img = s[k]
-                break
-        for k in ("label", "y", "target"):
-            if k in s:
-                y = s[k]
-                break
-    else:
-        img = s
-    if not torch.is_tensor(img):
-        raise TypeError("Dataset phải trả về ảnh dạng torch.Tensor sau transform.")
-    if y is not None and not torch.is_tensor(y):
-        y = torch.tensor(y)
-    return img, y
-
-def _to_device_batch(x, y, device):
-    x = x.unsqueeze(0).to(device, non_blocking=True)
-    y = None if y is None else y.view(-1).to(device)
-    return x, y
-
-def _denorm_img(x, mean, std):
-    mean = torch.tensor(mean, dtype=x.dtype, device=x.device).view(-1,1,1)
-    std  = torch.tensor(std,  dtype=x.dtype, device=x.device).view(-1,1,1)
-    img = x * std + mean
-    return img.clamp(0,1).permute(1,2,0).detach().cpu().numpy()
-
-def _norm01_quantile(h, q=0.99, eps=1e-6):
-    if h.dim() == 3:
-        h = h.squeeze(0)
-    hp = h.clamp_min(0)
-    flat = hp.flatten()
-    if flat.numel() == 0:
-        return torch.zeros_like(h)
-    vmax = torch.quantile(flat, q)
-    if (not torch.isfinite(vmax)) or vmax <= 0:
-        vmax = flat.max()
-    vmax = vmax + eps
-    return (hp / vmax).clamp(0,1)
-
-def _overlay(img_hw3, heat_hw, alpha=0.45, cmap="jet"):
-    cmap_fn = cm.get_cmap(cmap)
-    heat_rgb = cmap_fn(heat_hw.detach().cpu().numpy())[...,:3]
-    overlay = (1 - alpha) * img_hw3 + alpha * heat_rgb
-    return overlay
-
-def visualize_methods(
-    ds,
-    idx,
-    attr_dict,
-    use_pred: bool,
-    device: str,
+def denorm_image(
+    img: torch.Tensor,
     mean=(0.485, 0.456, 0.406),
     std=(0.229, 0.224, 0.225),
-    alpha: float = 0.45,
-    cmap_name: str = "jet",
-    q: float = 0.99,
+) -> np.ndarray:
+    """
+    img: [C,H,W], tensor trên CPU, đã normalize theo mean/std.
+    Trả về ảnh numpy [H,W,3] trong [0,1].
+    """
+    if isinstance(mean, (tuple, list)):
+        mean = torch.tensor(mean).view(-1, 1, 1)
+    if isinstance(std, (tuple, list)):
+        std = torch.tensor(std).view(-1, 1, 1)
+
+    x = img.clone()
+    x = x * std + mean
+    x = x.clamp(0.0, 1.0)
+    x = x.permute(1, 2, 0)  # [H,W,C]
+    return x.numpy()
+
+def visualize_methods(
+    dataset,
+    idx: int,
+    methods: dict,
+    use_pred: bool = True,
+    device: str = "cuda",
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225),
+    class_names=None,
+    vmax: float = 1.0,
+    save_path: str = None,
 ):
-    # Đảm bảo thứ tự cố định
-    if not isinstance(attr_dict, OrderedDict):
-        attr_dict = OrderedDict(attr_dict)
+    """
+    dataset: torch.utils.data.Dataset trả (image, label, ...) hoặc (image, label).
+    idx: index trong dataset.
+    methods: dict tên_phương_pháp -> attributor (có .attribute() và .model).
+    use_pred: True → giải thích theo lớp dự đoán; False → dùng label GT.
+    device: 'cuda' hoặc 'cpu'.
+    mean/std: dùng để de-normalize ảnh.
+    class_names: list tên class (tùy chọn).
+    vmax: max value cho heatmap (0–vmax). Mặc định 1.0.
+    save_path: nếu != None thì lưu figure ra file.
+    """
+    # Lấy mẫu từ dataset
+    sample = dataset[idx]
+    if isinstance(sample, (tuple, list)):
+        img = sample[0]
+        label = sample[1]
+    else:
+        img = sample
+        label = None
 
-    # 1) Lấy mẫu
-    img_t, y = _get_item(ds, idx)
-    x, y = _to_device_batch(img_t, y, device)
+    if isinstance(img, np.ndarray):
+        img = torch.from_numpy(img)
 
-    # 2) Backbone từ attributor đầu tiên
-    first_attr = next(iter(attr_dict.values()))
-    backbone = getattr(first_attr, "model", None)
-    if backbone is None:
-        raise RuntimeError("Các Attributor cần có thuộc tính .model để suy ra y_true.")
+    # Đảm bảo shape [C,H,W]
+    if img.ndim == 4:
+        img = img[0]
+    assert img.ndim == 3, f"Expect image [C,H,W], got {img.shape}"
 
-    backbone.to(device).eval()
-    with torch.no_grad():
-        logits_pred = backbone(x)
-        pred_cls = logits_pred.argmax(dim=1)
+    if isinstance(label, torch.Tensor):
+        label = int(label.item())
+    elif label is not None:
+        label = int(label)
 
-    y_true = pred_cls if (use_pred or y is None) else y
+    # Chuẩn bị input cho model
+    x = img.unsqueeze(0).to(device)  # [1,3,H,W]
 
-    # 3) Ảnh gốc (denorm) để overlay
-    img_np = _denorm_img(img_t.to(device), mean, std)
+    # Chọn model base để lấy logits/pred
+    first_attr = next(iter(methods.values()))
+    base_model = getattr(first_attr, "model", None)
 
-    # 4) Thu heatmap từ từng phương pháp
-    heatmaps = OrderedDict()
-    B, _, H, W = x.shape
+    pred_label = None
+    pred_prob = None
 
-    for name, attr in attr_dict.items():
-        # Đảm bảo attributor và backbone trên đúng device
-        if hasattr(attr, "model"):
-            attr.model.to(device).eval()
+    if base_model is not None:
+        base_model.eval()
+        with torch.no_grad():
+            logits = base_model(x)  # [1,C]
+            probs = logits.softmax(dim=-1)
+            pred_label = int(probs.argmax(dim=-1).item())
+            pred_prob = float(probs.max().item())
 
-        # Gọi attribute: tất cả method mới đều hỗ trợ (x, target=..., img_size=...)
-        token_scores, heatmap = attr.attribute(
-            x,
-            target=y_true,
-            img_size=(H, W),
-        )
-        # heatmap: [B,1,H,W]
-        h = heatmap[0, 0]  # [H,W]
-        h_norm = _norm01_quantile(h, q=q)
-        heatmaps[name] = h_norm
+    # Quyết định target cho attributors
+    if use_pred or label is None:
+        target_tensor = None  # để attributor tự argmax bên trong
+        label_to_show = pred_label
+    else:
+        target_tensor = torch.tensor([label], device=device, dtype=torch.long)
+        label_to_show = label
 
-    # 5) Vẽ lưới
-    n_methods = len(heatmaps)
+    # Gọi từng phương pháp để lấy heatmap
+    heatmaps = {}  # name -> [H,W] numpy
+    for name, attr in methods.items():
+        # Không dùng torch.no_grad() ở đây vì nhiều attributor cần backward
+        patch_rel, hm = attr.attribute(x, target=target_tensor, use_logits=True)
+        # hm: [1,1,H,W]
+        hm_2d = hm[0, 0].detach().cpu().numpy()
+        heatmaps[name] = hm_2d
+
+    # Chuẩn bị ảnh gốc (ở CPU)
+    img_vis = denorm_image(img.cpu(), mean=mean, std=std)
+
+    # Bố cục figure
+    n_methods = len(methods)
     n_plots = n_methods + 1  # +1 cho ảnh gốc
-    ncols = min(4, n_plots)
-    nrows = int(math.ceil(n_plots / ncols))
+    n_cols = min(4, n_plots)
+    n_rows = int(np.ceil(n_plots / n_cols))
 
-    fig, axs = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
-    axs = np.array(axs).reshape(nrows, ncols)
+    fig, axes = plt.subplots(
+        n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows)
+    )
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
+    axes = axes.reshape(-1)
 
-    # Ảnh gốc
-    axs[0, 0].imshow(img_np)
-    axs[0, 0].set_title("Original")
-    axs[0, 0].axis("off")
+    # Vẽ ảnh gốc ở ô đầu
+    ax0 = axes[0]
+    ax0.imshow(img_vis)
+    title0 = "Original"
+    if label_to_show is not None:
+        if class_names is not None and 0 <= label_to_show < len(class_names):
+            title0 += f"\nlabel={class_names[label_to_show]}"
+        else:
+            title0 += f"\nlabel={label_to_show}"
+    if pred_prob is not None:
+        title0 += f"  p={pred_prob:.2f}"
+    ax0.set_title(title0)
+    ax0.axis("off")
 
-    # Các heatmap
-    i = 1
-    for name, h in heatmaps.items():
-        r = i // ncols
-        c = i % ncols
-        axs[r, c].imshow(_overlay(img_np, h, alpha=alpha, cmap=cmap_name))
-        axs[r, c].set_title(name)
-        axs[r, c].axis("off")
-        i += 1
+    # Vẽ từng phương pháp
+    for ax, (name, hm) in zip(axes[1:], heatmaps.items()):
+        ax.imshow(img_vis)
+        ax.imshow(hm, cmap="jet", alpha=0.5, vmin=0.0, vmax=vmax)
+        ax.set_title(name)
+        ax.axis("off")
 
-    # Ẩn ô dư
-    while i < nrows * ncols:
-        r = i // ncols
-        c = i % ncols
-        axs[r, c].axis("off")
-        i += 1
+    # Ẩn các ô dư
+    for ax in axes[1 + len(heatmaps):]:
+        ax.axis("off")
 
     plt.tight_layout()
-    plt.show()
-
-    return heatmaps
-
+    if save_path is not None:
+        plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    return fig

@@ -1,110 +1,128 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+def tokens_to_heatmap(
+    token_scores: torch.Tensor,
+    grid_hw: Optional[Tuple[int, int]],
+    img_size: Optional[Tuple[int, int]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    token_scores: [B, N_patches] (không gồm cls)
+    grid_hw: (H_p, W_p) hoặc None
+    return: [B, 1, H_img, W_img]
+    """
+    B, num_patches = token_scores.shape
+
+    if grid_hw is not None:
+        H_p, W_p = grid_hw
+    else:
+        side = int(num_patches ** 0.5)
+        H_p, W_p = side, side
+
+    assert H_p * W_p == num_patches, "Số patch không khớp grid_size."
+
+    maps = token_scores.reshape(B, 1, H_p, W_p)
+
+    # chuẩn hoá 0–1
+    maps = maps - maps.amin(dim=(2, 3), keepdim=True)
+    maps = maps / (maps.amax(dim=(2, 3), keepdim=True) + eps)
+
+    if img_size is not None:
+        H_img, W_img = img_size
+    else:
+        # mặc định: mỗi patch 16×16 (vit_small_patch16_224)
+        H_img, W_img = H_p * 16, W_p * 16
+
+    maps_up = F.interpolate(
+        maps, size=(H_img, W_img), mode="bilinear", align_corners=False
+    )
+    return maps_up
 
 class Rollout(nn.Module):
-    """
-    Attention Rollout: tái tạo map A từ q,k (linear attention),
-    nhân chuỗi qua các block, lấy dòng CLS.
-
-    Trả về: {'rtokens_up': [B,H,W]}.
-    """
-    def __init__(self, model: nn.Module,
-                 start_layer: int = 0,
-                 eps: float = 1e-6):
+    def __init__(
+        self,
+        model: nn.Module,
+        has_cls: bool = True,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.model = model
-        self.blocks: List[nn.Module] = list(model.blocks)
-        self.start_layer = int(start_layer)
-        self.eps = float(eps)
-        self.has_cls = hasattr(model, "cls_token")
-        self.grid_hw = getattr(model.patch_embed, "grid_size", None)
-        pe = self.model.patch_embed.proj
-        self.stride = pe.stride[0]
+        self.blocks: List[nn.Module] = list(getattr(model, "blocks"))
+        self.has_cls = has_cls
+        self.eps = eps
 
-        self._hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self.attn_maps: List[torch.Tensor] = []
+        self.grid_hw: Optional[Tuple[int, int]] = getattr(
+            getattr(model, "patch_embed", None), "grid_size", None
+        )
 
-    def _register(self):
-        self._hooks.clear()
-        self.attn_maps = [None for _ in range(len(self.blocks))]
+    def _collect_attn(self) -> List[torch.Tensor]:
+        attn_maps = []
+        for blk in self.blocks:
+            attn_mod = getattr(blk, "attn", None)
+            if attn_mod is None:
+                raise RuntimeError("Block không có 'attn'.")
+            attn = getattr(attn_mod, "attn_map", None)
+            if attn is None:
+                raise RuntimeError(
+                    "block.attn.attn_map is None. "
+                    "Hãy bật attn_mod.record_attn=True trước forward."
+                )
+            attn_maps.append(attn.detach())  # [B, H, N, N]
+        return attn_maps
 
-        for li, blk in enumerate(self.blocks):
-            attn = blk.attn
+    def _build_rollout_matrix(self, attn_maps: List[torch.Tensor]) -> torch.Tensor:
+        B, H, N, _ = attn_maps[0].shape
+        device = attn_maps[0].device
 
-            def make_hook(idx):
-                def h(module, inputs, output):
-                    x_in = inputs[0]          # [B,N,C] sau norm1
-                    B, N, C = x_in.shape
-                    H = getattr(module, "h", getattr(module, "num_heads", None))
-                    if H is None:
-                        raise RuntimeError("Không tìm được số head trong attention.")
-                    D = getattr(module, "d", C // H)
+        A_rollout = torch.eye(N, device=device).unsqueeze(0).repeat(B, 1, 1)
 
-                    qkv = module.qkv(x_in).view(B, N, 3, H, D).permute(2,0,3,1,4)
-                    q, k = qkv[0], qkv[1]        # [B,H,N,D]
+        for A_l in attn_maps:
+            # average over heads
+            A_mean = A_l.mean(dim=1)  # [B, N, N]
+            I = torch.eye(N, device=device).unsqueeze(0)  # [1, N, N]
+            A_tilde = A_mean + I
+            A_rollout = torch.bmm(A_rollout, A_tilde)
 
-                    if hasattr(module, "_phi"):
-                        qf = module._phi(q)
-                        kf = module._phi(k)
-                    else:
-                        qf, kf = q, k
+        return A_rollout  # [B, N, N]
 
-                    k_sum = kf.sum(dim=2, keepdim=True)        # [B,H,1,D]
-                    den = (qf * k_sum).sum(dim=-1, keepdim=True) + self.eps  # [B,H,N,1]
-                    A = torch.einsum('bhnd,bhmd->bhnm', qf, kf) / den        # [B,H,N,N]
-                    A = A.mean(dim=1)                                       # [B,N,N]
-                    self.attn_maps[idx] = A.detach()
-                return h
-            self._hooks.append(attn.register_forward_hook(make_hook(li)))
-
-    def _clear(self):
-        for h in self._hooks:
-            h.remove()
-        self._hooks.clear()
-
-    def attribute(self,
-                  x: torch.Tensor,
-                  y_true: Optional[torch.Tensor] = None):
-        """
-        x: [B,3,H,W]
-        """
-        B, _, H, W = x.shape
+    def attribute(
+        self,
+        x: torch.Tensor,
+        target: Optional[torch.Tensor] = None,  # không dùng, chỉ để API giống
+        img_size: Optional[Tuple[int, int]] = None,
+    ):
         self.model.eval()
+        device = next(self.model.parameters()).device
+        x = x.to(device)
+
+        # bật record_attn
+        for blk in self.blocks:
+            attn_mod = getattr(blk, "attn", None)
+            if attn_mod is not None and hasattr(attn_mod, "record_attn"):
+                attn_mod.record_attn = True
+
+        # 1 forward là đủ
         with torch.no_grad():
-            self._register()
             _ = self.model(x)
-            self._clear()
 
-        A_list = self.attn_maps
-        assert all(a is not None for a in A_list), "Rollout: không thu được attention map."
+        attn_maps = self._collect_attn()
+        A_rollout = self._build_rollout_matrix(attn_maps)
 
-        N = A_list[0].size(1)
-        eye = torch.eye(N, device=x.device).unsqueeze(0).expand(B, -1, -1)
-
-        joint = eye
-        for A in A_list[self.start_layer:]:
-            A = A.clamp_min(0)
-            A = A / (A.sum(dim=-1, keepdim=True) + self.eps)
-            A_hat = A + eye
-            A_hat = A_hat / (A_hat.sum(dim=-1, keepdim=True) + self.eps)
-            joint = joint @ A_hat
+        cls_row = A_rollout[:, 0, :]  # [B, N]
 
         if self.has_cls:
-            cam_tokens = joint[:, 0, 1:]       # [B,Np]
+            token_scores = cls_row[:, 1:]
         else:
-            cam_tokens = joint.mean(dim=1)     # [B,N]
+            token_scores = cls_row
 
-        if self.grid_hw is not None:
-            Hn, Wn = self.grid_hw
-        else:
-            Hn, Wn = H // self.stride, W // self.stride
+        # chuẩn hoá
+        token_scores = token_scores - token_scores.amin(dim=1, keepdim=True)
+        token_scores = token_scores / (
+            token_scores.amax(dim=1, keepdim=True) + self.eps
+        )
 
-        cam_map = cam_tokens.view(B, 1, Hn, Wn)
-        rtokens  = cam_map[:, 0]
-        cam_up = F.interpolate(cam_map, size=(H,W), mode='bilinear', align_corners=False)[:,0]
-        return {
-            "rtokens":    rtokens.detach(),
-            "rtokens_up": cam_up.detach()
-        }
+        heatmap = tokens_to_heatmap(token_scores, self.grid_hw, img_size, self.eps)
+        return token_scores, heatmap

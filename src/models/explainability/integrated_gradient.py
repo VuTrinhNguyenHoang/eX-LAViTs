@@ -1,81 +1,111 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
 class IntegratedGradient(nn.Module):
-    def __init__(self, model: nn.Module, steps: int = 32):
+    def __init__(
+        self,
+        model: nn.Module,
+        steps: int = 32,
+        has_cls: bool = True,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.model = model
-        self.steps = int(steps)
+        self.steps = steps
+        self.has_cls = has_cls
+        self.eps = eps
 
-        # lấy stride patch để gom về token
-        pe = self.model.patch_embed.proj
-        self.stride = pe.stride[0]
+        self.grid_hw: Optional[Tuple[int, int]] = getattr(
+            getattr(model, "patch_embed", None), "grid_size", None
+        )
 
     def attribute(
         self,
-        x: torch.Tensor,                      # [B,3,H,W]
-        y_true: Optional[torch.Tensor] = None,
+        x: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
         baseline: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None
-    ) -> Dict[str, torch.Tensor]:
-
-        assert x.dim() == 4 and x.size(1) == 3
-        B, _, H, W = x.shape
-        steps = int(steps or self.steps)
-
+        img_size: Optional[Tuple[int, int]] = None,
+    ):
         self.model.eval()
-        torch.set_grad_enabled(True)
-        for p in self.model.parameters():
-            p.requires_grad_(True)
+        device = next(self.model.parameters()).device
 
+        x = x.to(device)
         if baseline is None:
             baseline = torch.zeros_like(x)
+        else:
+            baseline = baseline.to(device)
 
-        if y_true is None:
-            with torch.no_grad():
-                logits = self.model(x)
-                y_true = logits.argmax(dim=1)
+        # xác định target từ x thật, giữ cố định cho mọi bước
+        self.model.zero_grad(set_to_none=True)
+        logits = self.model(x)
+        B, C = logits.shape
 
-        delta = x - baseline
+        if target is None:
+            target = logits.argmax(dim=-1)
+        else:
+            target = target.to(logits.device)
+
+        idx = torch.arange(B, device=logits.device)
+
+        # tích lũy gradient
         total_grad = torch.zeros_like(x)
 
-        for i in range(1, steps + 1):
-            alpha = float(i) / steps
-            x_i = baseline + alpha * delta
-            x_i.requires_grad_(True)
+        for t in range(1, self.steps + 1):
+            alpha = float(t) / self.steps
+            x_t = baseline + alpha * (x - baseline)
+            x_t = x_t.detach().requires_grad_(True)
 
             self.model.zero_grad(set_to_none=True)
-            logits = self.model(x_i)                      # [B,K]
-            score = logits.gather(1, y_true[:, None]).sum()
-            score.backward()
+            logits_t = self.model(x_t)
 
-            total_grad += x_i.grad.detach()
+            logit_target_t = logits_t[idx, target]
+            logit_target_t.sum().backward()
 
-        avg_grad = total_grad / steps
-        ig = delta * avg_grad                            # [B,3,H,W]
+            total_grad += x_t.grad.detach()
 
-        # pixel-level heat (nếu cần)
-        heat_pix = ig.sum(dim=1, keepdim=True)           # [B,1,H,W]
+        avg_grad = total_grad / float(self.steps)
 
-        # ---- token-level: gom theo patch ----
-        S = self.stride
-        assert H % S == 0 and W % S == 0, "H,W phải chia hết cho stride patch."
-        Hn, Wn = H // S, W // S
+        # IG attribution
+        attributions = (x - baseline) * avg_grad  # [B, 3, H, W]
 
-        heat_tok = F.avg_pool2d(heat_pix, kernel_size=S, stride=S)  # [B,1,Hn,Wn]
-        rtokens = heat_tok[:, 0]                                    # [B,Hn,Wn]
+        # gộp kênh -> [B,1,H,W]
+        attr_map = attributions.sum(dim=1, keepdim=True)
 
-        # ---- upsample cho trực quan ----
-        rtokens_up = F.interpolate(
-            heat_tok,
-            size=(H, W),
-            mode="bilinear",
-            align_corners=False
-        )[:, 0]                                                     # [B,H,W]
+        # chuẩn hoá 0–1
+        attr_map = attr_map - attr_map.amin(dim=(2, 3), keepdim=True)
+        attr_map = attr_map / (
+            attr_map.amax(dim=(2, 3), keepdim=True) + self.eps
+        )
 
-        return {
-            "rtokens":     rtokens.detach(),  # dùng cho metrics token-level
-            "rtokens_up":  rtokens_up.detach()
-        }
+        # mapping về token_scores bằng pooling theo grid
+        if self.grid_hw is not None:
+            H_p, W_p = self.grid_hw
+        else:
+            # suy ra từ kích thước ảnh nếu chưa có
+            _, _, H_img, W_img = attr_map.shape
+            H_p, W_p = H_img // 16, W_img // 16
+
+        # [B,1,H_p,W_p]
+        patch_attr = F.adaptive_avg_pool2d(attr_map, (H_p, W_p))
+        token_scores = patch_attr.reshape(x.shape[0], -1)  # [B, N_patches]
+
+        # chuẩn hoá lại tokens
+        token_scores = token_scores - token_scores.amin(dim=1, keepdim=True)
+        token_scores = token_scores / (
+            token_scores.amax(dim=1, keepdim=True) + self.eps
+        )
+
+        # heatmap ở resolution ảnh
+        if img_size is not None:
+            heatmap = F.interpolate(
+                attr_map,
+                size=img_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            heatmap = attr_map
+
+        return token_scores, heatmap

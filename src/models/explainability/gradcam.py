@@ -3,149 +3,120 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 
+def tokens_to_heatmap(
+    token_scores: torch.Tensor,
+    grid_hw: Optional[Tuple[int, int]],
+    img_size: Optional[Tuple[int, int]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    token_scores: [B, N_patches] (không gồm cls)
+    grid_hw: (H_p, W_p) hoặc None
+    return: [B, 1, H_img, W_img]
+    """
+    B, num_patches = token_scores.shape
+
+    if grid_hw is not None:
+        H_p, W_p = grid_hw
+    else:
+        side = int(num_patches ** 0.5)
+        H_p, W_p = side, side
+
+    assert H_p * W_p == num_patches, "Số patch không khớp grid_size."
+
+    maps = token_scores.reshape(B, 1, H_p, W_p)
+
+    # chuẩn hoá 0–1
+    maps = maps - maps.amin(dim=(2, 3), keepdim=True)
+    maps = maps / (maps.amax(dim=(2, 3), keepdim=True) + eps)
+
+    if img_size is not None:
+        H_img, W_img = img_size
+    else:
+        # mặc định: mỗi patch 16×16 (vit_small_patch16_224)
+        H_img, W_img = H_p * 16, W_p * 16
+
+    maps_up = F.interpolate(
+        maps, size=(H_img, W_img), mode="bilinear", align_corners=False
+    )
+    return maps_up
+
 class ViTGradCAM(nn.Module):
-    """
-    Grad-CAM cho ViT/LinearAttention.
-
-    Trả về:
-      {'rtokens_up': [B,H,W], 'logits': [B,K], 'cam_tokens': [B,Np]}
-    """
-    def __init__(self, model: nn.Module,
-                 target_block: int = -1,
-                 hook_at: str = "attn",           # 'attn' | 'block'
-                 exclude_cls: bool = True,
-                 pool: str = "channel"):          # 'channel' | 'token'
+    def __init__(self, model: nn.Module, has_cls: bool = True, eps: float = 1e-6):
         super().__init__()
-        assert hook_at in {"attn", "block"}
-        assert pool in {"channel", "token"}
         self.model = model
-        self.block = model.blocks[target_block]
-        self.mod = self.block.attn if hook_at == "attn" else self.block
-        self.exclude_cls = exclude_cls and hasattr(model, "cls_token")
-        self.pool = pool
+        self.has_cls = has_cls
+        self.eps = eps
 
-        self._act = None   # [B,N,C]
-        self._grad = None  # [B,N,C]
+        self.blocks: List[nn.Module] = list(getattr(model, "blocks"))
+        self.grid_hw: Optional[Tuple[int, int]] = getattr(
+            getattr(model, "patch_embed", None), "grid_size", None
+        )
 
-        def _fwd_hook(module, inp, out):
-            self._act = out
-            if isinstance(out, torch.Tensor) and out.requires_grad:
-                out.register_hook(lambda g: setattr(self, "_grad", g))
-        self._fh = self.mod.register_forward_hook(_fwd_hook)
+        self.activations: Optional[torch.Tensor] = None
+        self.gradients: Optional[torch.Tensor] = None
 
-        pe = self.model.patch_embed.proj
-        self.stride = pe.stride[0]
+        last_block = self.blocks[-1]
 
-    def remove_hooks(self):
-        self._fh.remove()
+        def f_hook(module, inp, out):
+            self.activations = out  # [B, N, C]
 
-    @staticmethod
-    def _minmax01(x: torch.Tensor) -> torch.Tensor:
-        B = x.size(0)
-        flat = x.view(B, -1)
-        vmin = flat.min(dim=1, keepdim=True)[0].unsqueeze(-1)
-        vmax = flat.max(dim=1, keepdim=True)[0].unsqueeze(-1)
-        return (x - vmin) / (vmax - vmin + 1e-6)
+        def b_hook(module, grad_in, grad_out):
+            self.gradients = grad_out[0]  # [B, N, C]
 
-    def _cam_from_AG(self, A: torch.Tensor, G: torch.Tensor) -> torch.Tensor:
-        """
-        A,G: [B,N,C] tại module đích.
-        Trả về cam_tokens: [B,Np] với/không CLS.
-        """
-        if self.exclude_cls:
-            A = A[:, 1:, :]
-            G = G[:, 1:, :]
+        last_block.register_forward_hook(f_hook)
+        last_block.register_full_backward_hook(b_hook)
 
-        if self.pool == "channel":
-            alpha = G.mean(dim=1, keepdim=False)                  # [B,C]
-            cam = torch.relu(torch.einsum('bnc,bc->bn', A, alpha))
-        else:
-            cam = torch.relu((A * G).sum(dim=-1))
-        return cam
-
-    def _upsample_tokens(self, cam_tokens: torch.Tensor, H: int, W: int) -> torch.Tensor:
-        B = cam_tokens.size(0)
-
-        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
-            Hn, Wn = self.model.patch_embed.grid_size
-        else:
-            Hn, Wn = H // self.stride, W // self.stride
-
-        Ngrid = Hn * Wn
-        Nt = cam_tokens.size(1)
-
-        if Nt == Ngrid + 1 and hasattr(self.model, "cls_token"):
-            cam_tokens = cam_tokens[:, 1:]
-            Nt = cam_tokens.size(1)
-
-        if Nt != Ngrid:
-            raise RuntimeError(f"GradCAM: số token {Nt} không khớp lưới {Hn}x{Wn}={Ngrid}.")
-
-        cam_map = cam_tokens.view(B, 1, Hn, Wn)
-        cam_up  = F.interpolate(cam_map, size=(H, W), mode='bilinear', align_corners=False)[:, 0]
-        return self._minmax01(cam_up)
-
-    def _forward_backward_once(self, x: torch.Tensor, y_true: Optional[torch.Tensor]):
-        self.model.zero_grad(set_to_none=True)
-        logits = self.model(x)                                # [B,K]
-        if y_true is None:
-            y_true = logits.argmax(dim=1)
-        score = logits.gather(1, y_true[:, None]).sum()
-        score.backward()
-        A = self._act.detach()
-        G = self._grad.detach()
-        return logits.detach(), A, G
-
-    def attribute(self,
-                  x: torch.Tensor,
-                  y_true: Optional[torch.Tensor] = None,
-                  smooth: int = 0,
-                  noise_std: float = 0.15):
-        assert x.dim() == 4 and x.size(1) == 3
-        B, _, H, W = x.shape
+    def attribute(
+        self,
+        x: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+        img_size: Optional[Tuple[int, int]] = None,
+    ):
         self.model.eval()
-        torch.set_grad_enabled(True)
-        for p in self.model.parameters():
-            p.requires_grad_(True)
-        
-        if smooth <= 0:
-            logits, A, G = self._forward_backward_once(x, y_true)
-            cam_tokens = self._cam_from_AG(A, G)
-            if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
-                Hn, Wn = self.model.patch_embed.grid_size
-            else:
-                Hn, Wn = H // self.stride, W // self.stride
-            cam_map = cam_tokens.view(B, Hn, Wn)        # [B,Hn,Wn]
+        self.model.zero_grad(set_to_none=True)
 
-            cam_up = self._upsample_tokens(cam_tokens, H, W)
+        x = x.to(next(self.model.parameters()).device)
+        logits = self.model(x)  # [B, C]
+        B, C = logits.shape
 
-            return {
-                "rtokens":    cam_map.detach(),         # token-level
-                "rtokens_up": cam_up.detach(),          # pixel-level (vis)
-                "logits":     logits,
-                "cam_tokens": cam_tokens.detach(),
-            }
-
-        cams = []
-        last_logits = None
-        x_std = x.float().flatten(1).std(dim=1).view(B, 1, 1, 1).clamp_min(1e-6)
-        for _ in range(int(smooth)):
-            noise = torch.randn_like(x) * (noise_std * x_std)
-            logits, A, G = self._forward_backward_once(x + noise, y_true)
-            last_logits = logits
-            cams.append(self._cam_from_AG(A, G))
-        cam_tokens = torch.stack(cams, dim=0).mean(0)
-        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
-            Hn, Wn = self.model.patch_embed.grid_size
+        if target is None:
+            target = logits.argmax(dim=-1)
         else:
-            Hn, Wn = H // self.stride, W // self.stride
-        cam_map = cam_tokens.view(B, Hn, Wn)        # [B,Hn,Wn]
+            target = target.to(logits.device)
 
-        cam_up = self._upsample_tokens(cam_tokens, H, W)
+        idx = torch.arange(B, device=logits.device)
+        logit_target = logits[idx, target]
 
-        return {
-            "rtokens":    cam_map.detach(),         # token-level
-            "rtokens_up": cam_up.detach(),          # pixel-level (vis)
-            "logits":     logits,
-            "cam_tokens": cam_tokens.detach(),
-        }
+        logit_target.sum().backward()
+
+        A = self.activations  # [B, N, C]
+        G = self.gradients    # [B, N, C]
+
+        if A is None or G is None:
+            raise RuntimeError("Hooks của GradCAM chưa được kích hoạt.")
+
+        # trọng số kênh: mean gradient trên tokens
+        # w: [B, C]
+        w = G.mean(dim=1)
+
+        # CAM per token: Σ_k w_k * A_{j,k}
+        # [B, N]
+        cam = (A * w.unsqueeze(1)).sum(dim=-1)
+        cam = F.relu(cam)
+
+        # bỏ cls token nếu có
+        if self.has_cls:
+            token_scores = cam[:, 1:]
+        else:
+            token_scores = cam
+
+        # chuẩn hoá mỗi mẫu
+        token_scores = token_scores - token_scores.amin(dim=1, keepdim=True)
+        token_scores = token_scores / (
+            token_scores.amax(dim=1, keepdim=True) + self.eps
+        )
+
+        heatmap = tokens_to_heatmap(token_scores, self.grid_hw, img_size, self.eps)
+        return token_scores, heatmap
+    

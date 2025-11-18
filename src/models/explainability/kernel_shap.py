@@ -2,89 +2,176 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from typing import Optional
+from typing import Optional, Tuple
+
+def tokens_to_heatmap(
+    token_scores: torch.Tensor,
+    grid_hw: Optional[Tuple[int, int]],
+    img_size: Optional[Tuple[int, int]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    token_scores: [B, N_patches] (không gồm cls)
+    grid_hw: (H_p, W_p) hoặc None
+    return: [B, 1, H_img, W_img]
+    """
+    B, num_patches = token_scores.shape
+
+    if grid_hw is not None:
+        H_p, W_p = grid_hw
+    else:
+        side = int(num_patches ** 0.5)
+        H_p, W_p = side, side
+
+    assert H_p * W_p == num_patches, "Số patch không khớp grid_size."
+
+    maps = token_scores.reshape(B, 1, H_p, W_p)
+
+    # chuẩn hoá 0–1
+    maps = maps - maps.amin(dim=(2, 3), keepdim=True)
+    maps = maps / (maps.amax(dim=(2, 3), keepdim=True) + eps)
+
+    if img_size is not None:
+        H_img, W_img = img_size
+    else:
+        # mặc định: mỗi patch 16×16 (vit_small_patch16_224)
+        H_img, W_img = H_p * 16, W_p * 16
+
+    maps_up = F.interpolate(
+        maps, size=(H_img, W_img), mode="bilinear", align_corners=False
+    )
+    return maps_up
 
 class KernelSHAP(nn.Module):
-    """
-    KernelSHAP xấp xỉ trên không gian patch.
-
-    Hiện tại triển khai đơn giản với batch=1 (thường dùng cho XAI).
-    Trả về: {'rtokens_up': [1,H,W]}.
-    """
-    def __init__(self, model: nn.Module,
-                 nsamples: int = 256):
+    def __init__(
+        self,
+        model: nn.Module,
+        n_samples: int = 256,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.model = model
-        self.nsamples = int(nsamples)
-        pe = self.model.patch_embed.proj
-        self.patch_size = pe.kernel_size[0]
-        self.stride = pe.stride[0]
+        self.n_samples = n_samples
+        self.eps = eps
 
-    def _grid_hw(self, x: torch.Tensor):
-        if hasattr(self.model.patch_embed, "grid_size") and self.model.patch_embed.grid_size is not None:
-            return self.model.patch_embed.grid_size
-        B, _, H, W = x.shape
-        return H // self.patch_size, W // self.patch_size
+        self.grid_hw: Optional[Tuple[int, int]] = getattr(
+            getattr(model, "patch_embed", None), "grid_size", None
+        )
 
-    def attribute(self,
-                  x: torch.Tensor,
-                  y_true: Optional[torch.Tensor] = None,
-                  baseline: Optional[torch.Tensor] = None,
-                  nsamples: Optional[int] = None):
-        assert x.size(0) == 1, "KernelSHAPAttributor hiện chỉ hỗ trợ batch=1."
+    def _build_masked_input(
+        self,
+        x: torch.Tensor,
+        baseline: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        x, baseline: [1, 3, H, W]
+        mask: [N_patches]
+        Trả về masked_x: [1, 3, H, W]
+        """
+        B, C, H, W = x.shape
+        N_patches = mask.numel()
+
+        if self.grid_hw is not None:
+            H_p, W_p = self.grid_hw
+        else:
+            H_p = W_p = int(N_patches ** 0.5)
+
+        patch_h = H // H_p
+        patch_w = W // W_p
+
+        mask_2d = mask.view(H_p, W_p)  # [H_p, W_p]
+
+        masked_x = baseline.clone()
+
+        # broadcast mask lên ảnh
+        for i in range(H_p):
+            for j in range(W_p):
+                if mask_2d[i, j] == 1:
+                    h0 = i * patch_h
+                    h1 = (i + 1) * patch_h
+                    w0 = j * patch_w
+                    w1 = (j + 1) * patch_w
+                    masked_x[:, :, h0:h1, w0:w1] = x[:, :, h0:h1, w0:w1]
+
+        return masked_x
+
+    def attribute(
+        self,
+        x: torch.Tensor,
+        target: Optional[torch.Tensor] = None,
+        baseline: Optional[torch.Tensor] = None,
+        img_size: Optional[Tuple[int, int]] = None,
+    ):
         self.model.eval()
-        with torch.no_grad():
-            if y_true is None:
-                logits = self.model(x)
-                y_true = logits.argmax(dim=1)
+        device = next(self.model.parameters()).device
+
+        x = x.to(device)
+        assert (
+            x.shape[0] == 1
+        ), "KernelSHAPViT hiện chỉ hỗ trợ B=1 mỗi lần để đơn giản."
 
         if baseline is None:
             baseline = torch.zeros_like(x)
+        else:
+            baseline = baseline.to(device)
 
-        nsamples = int(nsamples or self.nsamples)
-        device = x.device
-        B, _, H, W = x.shape
-        Hn, Wn = self._grid_hw(x)
-        Np = Hn * Wn
+        # xác định target từ x thật
+        with torch.no_grad():
+            logits = self.model(x)  # [1, C]
+        if target is None:
+            target = logits.argmax(dim=-1)  # [1]
+        else:
+            target = target.to(logits.device)
 
-        delta = x - baseline
+        # số patch
+        if self.grid_hw is not None:
+            H_p, W_p = self.grid_hw
+            N_p = H_p * W_p
+        else:
+            _, _, H, W = x.shape
+            H_p = W_p = H // 16
+            N_p = H_p * W_p
 
-        Ms = []
-        Ys = []
-        for _ in range(nsamples):
-            m = torch.randint(0, 2, (Np,), device=device, dtype=torch.float32)
-            s = m.sum()
-            if s == 0 or s == Np:
-                m = 1.0 - m
-            Ms.append(m)
+        # sinh mask
+        M = self.n_samples
+        Z = torch.zeros(M, N_p, device=device)
+        y = torch.zeros(M, device=device)
 
-            mask = m.view(1,1,Hn,Wn)
-            mask_up = F.interpolate(mask, size=(H,W), mode='nearest')
-            x_m = baseline + mask_up * delta
+        for m in range(M):
+            # mask có ít nhất 1 patch on và không trivially all-ones
+            while True:
+                mask = torch.randint(0, 2, (N_p,), device=device)
+                if mask.sum() > 0 and mask.sum() < N_p:
+                    break
+
+            masked_x = self._build_masked_input(x, baseline, mask).to(device)
 
             with torch.no_grad():
-                logits_m = self.model(x_m)
-                y_m = logits_m.gather(1, y_true[:,None]).squeeze(1)
-            Ys.append(y_m)
+                logits_m = self.model(masked_x)  # [1, C]
 
-        M = torch.stack(Ms, dim=0)          # [L,Np]
-        Y = torch.stack(Ys, dim=0).view(-1)          # [L]
+            y[m] = logits_m[0, target.item()]
+            Z[m] = mask
 
-        s_frac = M.mean(dim=1, keepdim=True).clamp_(1e-6, 1-1e-6)
-        w = (Np - 1) / (s_frac * (1 - s_frac))      # [L,1]
-        MtW = (M * w).t()                           # [Np,L]
-        A = MtW @ M + 1e-6 * torch.eye(Np, device=device)
-        b = MtW @ Y.unsqueeze(-1)                   # [Np,1]
-        phi = torch.linalg.solve(A, b).squeeze(-1)  # [Np]
+        # thêm cột intercept
+        # design matrix: [M, N_p + 1]
+        ones = torch.ones(M, 1, device=device)
+        X_mat = torch.cat([ones, Z], dim=1)  # [M, N_p + 1]
 
-        phi_pos = phi.clamp_min(0)
-        if phi_pos.max() > 0:
-            phi_pos = phi_pos / phi_pos.max()
+        # giải least squares: (X^T X)^{-1} X^T y
+        # beta: [N_p + 1]
+        beta, *_ = torch.linalg.lstsq(X_mat, y.unsqueeze(-1))  # [N_p + 1, 1]
+        beta = beta.squeeze(-1)
 
-        cam = phi_pos.view(1,1,Hn,Wn)
-        rtokens = cam[:,0]
-        cam_up = F.interpolate(cam, size=(H,W), mode='bilinear', align_corners=False)[:,0]
-        return {
-            "rtokens":    rtokens.detach(),
-            "rtokens_up": cam_up.detach()
-        }
+        # shap patch = beta[1:]
+        shap_vals = beta[1:]  # [N_p]
+
+        # chuẩn hoá 0–1
+        shap_vals = shap_vals.unsqueeze(0)  # [1, N_p]
+        shap_vals = shap_vals - shap_vals.amin(dim=1, keepdim=True)
+        shap_vals = shap_vals / (shap_vals.amax(dim=1, keepdim=True) + self.eps)
+
+        token_scores = shap_vals  # [1, N_p]
+        heatmap = tokens_to_heatmap(token_scores, self.grid_hw, img_size, self.eps)
+
+        return token_scores, heatmap

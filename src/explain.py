@@ -63,85 +63,74 @@ def _overlay(img_hw3, heat_hw, alpha=0.45, cmap="jet"):
 def visualize_methods(
     ds,
     idx,
-    attr_dict: OrderedDict,
+    attr_dict,
     use_pred: bool,
     device: str,
-    mean=(0.485,0.456,0.406),
-    std=(0.229,0.224,0.225),
+    mean=(0.485, 0.456, 0.406),
+    std=(0.229, 0.224, 0.225),
     alpha: float = 0.45,
     cmap_name: str = "jet",
-    q: float = 0.99
+    q: float = 0.99,
 ):
-    """
-    ds: dataset, phần tử ds[idx] -> (img, label) hoặc dict.
-    attr_dict: OrderedDict tên_phương_pháp -> Attributor (SSRP, IG, ...)
+    # Đảm bảo thứ tự cố định
+    if not isinstance(attr_dict, OrderedDict):
+        attr_dict = OrderedDict(attr_dict)
 
-    Mỗi attributor nên có:
-        attribute(x, y_true) -> dict với:
-          - 'rtokens_up': [B,H,W] (ưu tiên cho trực quan)
-          - (hoặc) 'rtokens': [B,Hn,Wn]  -> sẽ tự upsample
-          - (fallback) 'rpix': [B,3,H,W]
-    """
-
-    # 1) lấy mẫu
+    # 1) Lấy mẫu
     img_t, y = _get_item(ds, idx)
     x, y = _to_device_batch(img_t, y, device)
 
-    # 2) y_true từ backbone đầu tiên
+    # 2) Backbone từ attributor đầu tiên
     first_attr = next(iter(attr_dict.values()))
     backbone = getattr(first_attr, "model", None)
     if backbone is None:
         raise RuntimeError("Các Attributor cần có thuộc tính .model để suy ra y_true.")
+
     backbone.to(device).eval()
     with torch.no_grad():
         logits_pred = backbone(x)
         pred_cls = logits_pred.argmax(dim=1)
+
     y_true = pred_cls if (use_pred or y is None) else y
 
-    # 3) ảnh gốc denorm
+    # 3) Ảnh gốc (denorm) để overlay
     img_np = _denorm_img(img_t.to(device), mean, std)
 
-    # 4) thu heatmap (pixel-level, dùng cho overlay) từ từng phương pháp
+    # 4) Thu heatmap từ từng phương pháp
     heatmaps = OrderedDict()
     B, _, H, W = x.shape
 
     for name, attr in attr_dict.items():
-        attr.model.to(device).eval()
-        out = attr.attribute(x, y_true)
+        # Đảm bảo attributor và backbone trên đúng device
+        if hasattr(attr, "model"):
+            attr.model.to(device).eval()
 
-        if "rtokens_up" in out:
-            # đã có upsample sẵn H×W
-            h = out["rtokens_up"][0]      # [H,W]
-        elif "rtokens" in out:
-            # chỉ có token map -> tự upsample
-            rtok = out["rtokens"][0]      # [Hn,Wn]
-            cam = rtok.unsqueeze(0).unsqueeze(0)  # [1,1,Hn,Wn]
-            h_up = F.interpolate(cam, size=(H, W), mode="bilinear",
-                                  align_corners=False)[0,0]
-            h = h_up
-        elif "rpix" in out:
-            # fallback: pixel-level theo kênh
-            h = out["rpix"][0].sum(dim=0)  # [H,W]
-        else:
-            raise RuntimeError(f"{name}: không tìm thấy 'rtokens_up', 'rtokens' hoặc 'rpix' trong output.")
+        # Gọi attribute: tất cả method mới đều hỗ trợ (x, target=..., img_size=...)
+        token_scores, heatmap = attr.attribute(
+            x,
+            target=y_true,
+            img_size=(H, W),
+        )
+        # heatmap: [B,1,H,W]
+        h = heatmap[0, 0]  # [H,W]
+        h_norm = _norm01_quantile(h, q=q)
+        heatmaps[name] = h_norm
 
-        heatmaps[name] = _norm01_quantile(h, q=q)
-
-    # 5) vẽ lưới
+    # 5) Vẽ lưới
     n_methods = len(heatmaps)
-    n_plots = n_methods + 1
+    n_plots = n_methods + 1  # +1 cho ảnh gốc
     ncols = min(4, n_plots)
     nrows = int(math.ceil(n_plots / ncols))
 
-    fig, axs = plt.subplots(nrows, ncols, figsize=(4*ncols, 4*nrows))
+    fig, axs = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
     axs = np.array(axs).reshape(nrows, ncols)
 
-    # ảnh gốc
-    axs[0,0].imshow(img_np)
-    axs[0,0].set_title("Original")
-    axs[0,0].axis("off")
+    # Ảnh gốc
+    axs[0, 0].imshow(img_np)
+    axs[0, 0].set_title("Original")
+    axs[0, 0].axis("off")
 
-    # các heatmap
+    # Các heatmap
     i = 1
     for name, h in heatmaps.items():
         r = i // ncols
@@ -151,7 +140,7 @@ def visualize_methods(
         axs[r, c].axis("off")
         i += 1
 
-    # ẩn ô dư
+    # Ẩn ô dư
     while i < nrows * ncols:
         r = i // ncols
         c = i % ncols
@@ -162,3 +151,4 @@ def visualize_methods(
     plt.show()
 
     return heatmaps
+

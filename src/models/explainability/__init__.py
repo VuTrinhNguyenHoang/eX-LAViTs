@@ -1,11 +1,15 @@
-from .gradcam import ViTGradCAM
-from .integrated_gradient import IntegratedGradient
-from .rollout import Rollout
-from .linear_rollout import LAGRA
+from .gradcam import ViTGradCAM, TextGradCAM
+from .integrated_gradient import IntegratedGradient, TextIntegratedGradient
+from .rollout import Rollout, TextRollout
+from .linear_rollout import LAGRA, TextLAGRA
 
 __all__ = [
     "ViTGradCAM",
+    "TextGradCAM",
     "IntegratedGradient",
+    "TextIntegratedGradient",
     "Rollout",
-    "LAGRA"
+    "TextRollout",
+    "LAGRA",
+    "TextLAGRA",
 ]

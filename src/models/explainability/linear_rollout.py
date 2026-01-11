@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from typing import List, Optional, Tuple
+from dataclasses import dataclass
 
 def set_linear_attn_record(model: nn.Module, record: bool = True):
     for m in model.modules():
@@ -12,7 +13,7 @@ def set_linear_attn_record(model: nn.Module, record: bool = True):
             m.attn_map = None
 
 def tokens_to_heatmap(
-    patch_rel: torch.Tensor,  # [B, N_patches]
+    token_rel: torch.Tensor,  # [B, N_tokens]
     model: nn.Module,
     normalize: bool = True,
 ) -> torch.Tensor:
@@ -59,22 +60,67 @@ def tokens_to_heatmap(
 
     return heatmap  # [B,1,H,W]
 
+@dataclass
+class LAGRAConfig:
+    use_grad: bool = True
+    use_relu: bool = True
+    use_residual: bool = True
+    normalize: str = "double" # "single", "double", "none"
+    rollout: bool = True
+
 class LAGRA:
     def __init__(
         self,
         model: nn.Module,
         has_cls: bool = True,
         blocks_attr: str = "blocks",
-        eps: float = 1e-6
+        eps: float = 1e-6,
+        config: LAGRAConfig = LAGRAConfig(),
     ):
         self.model = model
         self.model.eval()
         self.blocks: List[nn.Module] = list(getattr(model, blocks_attr))
         self.has_cls = has_cls
         self.eps = eps
+        self.cfg = config
 
     def _enable_record_attn(self, flag: bool):
         set_linear_attn_record(self.model, record=flag)
+
+    def _build_joint(self, attn, grad, device):
+        """
+        attn: [B,H,N,N]
+        grad: [B,H,N,N] hoặc None
+        """
+        if self.cfg.use_grad and grad is not None:
+            joint = attn * grad
+        else:
+            joint = attn
+        
+        if self.cfg.use_relu:
+            joint = joint.clamp_min(0.0)
+        
+        joint = joint.mean(dim=1)  # [B,N,N]
+
+        if self.cfg.normalize in {"single", "double"}:
+            joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
+
+        if self.cfg.use_residual:
+            B, N, _ = joint.shape
+            eye = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
+            joint = joint + eye
+
+        if self.cfg.normalize == "double":
+            joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
+
+        return joint  # [B,N,N]
+
+    def _rollout(self, R_all, joint):
+        if not self.cfg.rollout:
+            return joint
+        if R_all is None:
+            return joint
+        return torch.bmm(R_all, joint)
 
     def attribute(
         self,
@@ -93,14 +139,11 @@ class LAGRA:
         one_hot = torch.zeros_like(logits).to(device)
         one_hot.scatter_(1, target.view(-1, 1), 1.0)
         
-        if use_logits:
-            out = (logits * one_hot).sum()
-        else:
-            probs = logits.softmax(dim=-1)
-            out = (probs * one_hot).sum()
+        score = (logits * one_hot).sum() if use_logits else \
+                (logits.softmax(dim=-1) * one_hot).sum()
 
         self.model.zero_grad(set_to_none=True)
-        out.backward(retain_graph=False)
+        score.backward()
 
         R_all = None
         for blk in self.blocks:
@@ -108,46 +151,30 @@ class LAGRA:
             if not isinstance(attn_layer, LinearMultiheadAttention):
                 continue
             attn = attn_layer.attn_map
+            grad = attn.grad if (attn is not None and attn.requires_grad) else None
             if attn is None:
                 continue
-            grad = attn_layer.attn_map.grad
-            if grad is None:
-                continue
 
-            joint = (attn * grad).clamp_min(0.0)  # [B,H,N,N]
-            joint = joint.mean(dim=1)             # [B,N,N]
-
-            joint_sum = joint.sum(dim=-1, keepdim=True) + self.eps
-            joint = joint / joint_sum
-
-            B_, N, _ = joint.shape
-            eye = torch.eye(N, device=device).unsqueeze(0).expand(B_, -1, -1)
-            joint = joint + eye
-            joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
-
-            if R_all is None:
-                R_all = joint
-            else:
-                R_all = torch.bmm(R_all, joint)
+            joint = self._build_joint(attn, grad, device)
+            R_all = self._rollout(R_all, joint)
 
         self._enable_record_attn(False)
         self.model.zero_grad(set_to_none=True)
 
         if R_all is None:
-            raise RuntimeError("Không thu được attn_map nào trong LAAttributor.")
+            raise RuntimeError("No attention maps collected.")
 
         if self.has_cls:
-            cls_idx = 0
-            token_rel = R_all[:, cls_idx, :]  # [B,N]
-            patch_rel = token_rel[:, 1:]      # [B,N_p]
+            token_rel = R_all[:, 0, 1:]
         else:
-            patch_rel = R_all.mean(dim=1)
+            token_rel = R_all.mean(dim=1)
 
-        patch_rel = patch_rel.clamp_min(0.0)
-        patch_rel = patch_rel / (patch_rel.amax(dim=-1, keepdim=True) + self.eps)
 
-        heatmap = tokens_to_heatmap(patch_rel, self.model, normalize=True)
-        return patch_rel, heatmap
+        token_rel = token_rel.clamp_min(0.0)
+        token_rel = token_rel / (token_rel.amax(dim=-1, keepdim=True) + self.eps)
+
+        heatmap = tokens_to_heatmap(token_rel, self.model)
+        return token_rel, heatmap
     
 class TextLAGRA:
     def __init__(

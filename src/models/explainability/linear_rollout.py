@@ -25,11 +25,11 @@ def tokens_to_heatmap(
         raise RuntimeError("model.patch_embed.grid_size không tồn tại.")
 
     Hp, Wp = pe.grid_size  # số patch theo chiều H, W
-    B, Np = patch_rel.shape
+    B, Np = token_rel.shape
     assert Np == Hp * Wp, f"Mismatch N_patches={Np}, Hp*Wp={Hp*Wp}"
 
     # [B, 1, Hp, Wp]
-    attn_map = patch_rel.view(B, 1, Hp, Wp)
+    attn_map = token_rel.view(B, 1, Hp, Wp)
 
     # Lấy kích thước ảnh
     img_size = getattr(model, "img_size", None)

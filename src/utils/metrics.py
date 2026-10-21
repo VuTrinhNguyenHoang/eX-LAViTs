@@ -335,7 +335,8 @@ def auc_trapezoid(xs: np.ndarray, ys: np.ndarray) -> float:
     xs: [T], monotonically increasing (0→1)
     ys: [T], giá trị score đã normalize (0→1)
     """
-    return float(np.trapz(ys, xs))
+    integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
+    return float(integrate(ys, xs))
 
 def apply_patch_mask_to_image(
     x: torch.Tensor,           # [B,3,H,W]

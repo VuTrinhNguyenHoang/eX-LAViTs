@@ -65,8 +65,9 @@ class LAGRAConfig:
     use_grad: bool = True
     use_relu: bool = True
     use_residual: bool = True
-    normalize: str = "double" # "single", "double", "none"
+    normalize: str = "double"
     rollout: bool = True
+
 
 class LAGRA:
     def __init__(
@@ -75,52 +76,70 @@ class LAGRA:
         has_cls: bool = True,
         blocks_attr: str = "blocks",
         eps: float = 1e-6,
-        config: LAGRAConfig = LAGRAConfig(),
+        config: Optional[LAGRAConfig] = None,
     ):
-        self.model = model
-        self.model.eval()
+        self.model = model.eval()
         self.blocks: List[nn.Module] = list(getattr(model, blocks_attr))
         self.has_cls = has_cls
         self.eps = eps
-        self.cfg = config
+        self.cfg = config if config is not None else LAGRAConfig()
 
     def _enable_record_attn(self, flag: bool):
         set_linear_attn_record(self.model, record=flag)
 
     def _build_joint(self, attn, grad, device):
-        """
-        attn: [B,H,N,N]
-        grad: [B,H,N,N] hoặc None
-        """
-        if self.cfg.use_grad and grad is not None:
-            joint = attn * grad
-        else:
-            joint = attn
-        
+        joint = attn * grad if self.cfg.use_grad and grad is not None else attn
         if self.cfg.use_relu:
             joint = joint.clamp_min(0.0)
-        
-        joint = joint.mean(dim=1)  # [B,N,N]
-
+        joint = joint.mean(dim=1)
         if self.cfg.normalize in {"single", "double"}:
             joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
-
         if self.cfg.use_residual:
-            B, N, _ = joint.shape
-            eye = torch.eye(N, device=device).unsqueeze(0).expand(B, -1, -1)
-            joint = joint + eye
-
+            identity = torch.eye(joint.shape[-1], device=device).unsqueeze(0)
+            joint = joint + identity
         if self.cfg.normalize == "double":
             joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
+        return joint
 
-        return joint  # [B,N,N]
+    def _rollout(self, relevance, joint):
+        if relevance is None or not self.cfg.rollout:
+            return joint[:, :1, :] if self.has_cls else joint.mean(dim=1, keepdim=True)
+        return torch.bmm(relevance, joint)
 
-    def _rollout(self, R_all, joint):
-        if not self.cfg.rollout:
-            return joint
-        if R_all is None:
-            return joint
-        return torch.bmm(R_all, joint)
+    def _attribute_tokens(self, x, target=None, use_logits=True):
+        self.model.zero_grad(set_to_none=True)
+        self._enable_record_attn(True)
+        try:
+            logits = self.model(x)
+            if target is None:
+                target = logits.argmax(dim=-1)
+            one_hot = torch.zeros_like(logits)
+            one_hot.scatter_(1, target.reshape(-1, 1), 1.0)
+            values = logits if use_logits else logits.softmax(dim=-1)
+            (values * one_hot).sum().backward()
+
+            with torch.no_grad():
+                relevance = None
+                blocks = self.blocks if self.cfg.rollout else self.blocks[-1:]
+                for block in blocks:
+                    attn_layer = getattr(block, "attn", None)
+                    if not isinstance(attn_layer, LinearMultiheadAttention):
+                        continue
+                    attn = attn_layer.attn_map
+                    if attn is None:
+                        continue
+                    grad = attn.grad if attn.requires_grad else None
+                    joint = self._build_joint(attn, grad, x.device)
+                    relevance = self._rollout(relevance, joint)
+                    attn_layer.attn_map = None
+                if relevance is None:
+                    raise RuntimeError("No attention maps collected.")
+                token_rel = relevance[:, 0, 1:] if self.has_cls else relevance[:, 0, :]
+                token_rel = token_rel.clamp_min(0.0)
+                return token_rel / (token_rel.amax(dim=-1, keepdim=True) + self.eps)
+        finally:
+            self._enable_record_attn(False)
+            self.model.zero_grad(set_to_none=True)
 
     def attribute(
         self,
@@ -128,141 +147,16 @@ class LAGRA:
         target: Optional[torch.Tensor] = None,
         use_logits: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = x.device
-        self.model.zero_grad(set_to_none=True)
-        self._enable_record_attn(True)
-
-        logits = self.model(x)  # [B,C]
-        if target is None:
-            target = logits.argmax(dim=-1)  # [B]
-
-        one_hot = torch.zeros_like(logits).to(device)
-        one_hot.scatter_(1, target.view(-1, 1), 1.0)
-        
-        score = (logits * one_hot).sum() if use_logits else \
-                (logits.softmax(dim=-1) * one_hot).sum()
-
-        self.model.zero_grad(set_to_none=True)
-        score.backward()
-
-        R_all = None
-        for blk in self.blocks:
-            attn_layer = getattr(blk, "attn", None)
-            if not isinstance(attn_layer, LinearMultiheadAttention):
-                continue
-            attn = attn_layer.attn_map
-            grad = attn.grad if (attn is not None and attn.requires_grad) else None
-            if attn is None:
-                continue
-
-            joint = self._build_joint(attn, grad, device)
-            R_all = self._rollout(R_all, joint)
-
-        self._enable_record_attn(False)
-        self.model.zero_grad(set_to_none=True)
-
-        if R_all is None:
-            raise RuntimeError("No attention maps collected.")
-
-        if self.has_cls:
-            token_rel = R_all[:, 0, 1:]
-        else:
-            token_rel = R_all.mean(dim=1)
+        token_rel = self._attribute_tokens(x, target, use_logits)
+        return token_rel, tokens_to_heatmap(token_rel, self.model)
 
 
-        token_rel = token_rel.clamp_min(0.0)
-        token_rel = token_rel / (token_rel.amax(dim=-1, keepdim=True) + self.eps)
-
-        heatmap = tokens_to_heatmap(token_rel, self.model)
-        return token_rel, heatmap
-    
-class TextLAGRA:
-    def __init__(
-        self,
-        model: nn.Module,
-        has_cls: bool = True,
-        blocks_attr: str = "blocks",
-        eps: float = 1e-6
-    ):
-        self.model = model
-        self.model.eval()
-        self.blocks: List[nn.Module] = list(getattr(model, blocks_attr))
-        self.has_cls = has_cls
-        self.eps = eps
-
-    def _enable_record_attn(self, flag: bool):
-        set_linear_attn_record(self.model, record=flag)
-
+class TextLAGRA(LAGRA):
     def attribute(
         self,
         input_ids: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         use_logits: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        device = input_ids.device
-        self.model.zero_grad(set_to_none=True)
-        self._enable_record_attn(True)
-
-        logits = self.model(input_ids)          # [B,C]
-        if target is None:
-            target = logits.argmax(dim=-1)
-
-        one_hot = torch.zeros_like(logits).to(device)
-        one_hot.scatter_(1, target.view(-1, 1), 1.0)
-
-        if use_logits:
-            out = (logits * one_hot).sum()
-        else:
-            probs = logits.softmax(dim=-1)
-            out = (probs * one_hot).sum()
-
-        self.model.zero_grad(set_to_none=True)
-        out.backward(retain_graph=False)
-
-        R_all = None
-        for blk in self.blocks:
-            attn_layer = getattr(blk, "attn", None)
-            if not isinstance(attn_layer, LinearMultiheadAttention):
-                continue
-            attn = attn_layer.attn_map           # [B,H,N,N]
-            if attn is None:
-                continue
-            grad = attn_layer.attn_map.grad      # [B,H,N,N]
-            if grad is None:
-                continue
-
-            joint = (attn * grad).clamp_min(0.0)  # [B,H,N,N]
-            joint = joint.mean(dim=1)             # [B,N,N]
-
-            joint_sum = joint.sum(dim=-1, keepdim=True) + self.eps
-            joint = joint / joint_sum
-
-            B_, N, _ = joint.shape
-            eye = torch.eye(N, device=device).unsqueeze(0).expand(B_, -1, -1)
-            joint = joint + eye
-            joint = joint / (joint.sum(dim=-1, keepdim=True) + self.eps)
-
-            if R_all is None:
-                R_all = joint
-            else:
-                R_all = torch.bmm(R_all, joint)   # [B,N,N]
-
-        self._enable_record_attn(False)
-        self.model.zero_grad(set_to_none=True)
-
-        if R_all is None:
-            raise RuntimeError("Không thu được attn_map nào trong TextLAGRA.")
-
-        if self.has_cls:
-            cls_idx = 0
-            token_rel_full = R_all[:, cls_idx, :]  # [B,N]
-            token_rel = token_rel_full[:, 1:]      # bỏ CLS → [B,L_tok]
-        else:
-            token_rel = R_all.mean(dim=1)          # [B,N]
-
-        token_rel = token_rel.clamp_min(0.0)
-        token_rel = token_rel / (token_rel.amax(dim=-1, keepdim=True) + self.eps)
-
-        token_rel_map = token_rel.unsqueeze(1)     # [B,1,L_tok]
-        return token_rel, token_rel_map
-    
+        token_rel = self._attribute_tokens(input_ids, target, use_logits)
+        return token_rel, token_rel.unsqueeze(1)

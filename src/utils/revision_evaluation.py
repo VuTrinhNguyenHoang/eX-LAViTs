@@ -21,6 +21,7 @@ from ..models.explainability import (
     TextRollout,
     TextLAGRA,
 )
+from ..models.explainability.linear_rollout import LAGRAConfig
 from ..models.explainability.attention_baselines import (
     CDAM,
     GMAR,
@@ -46,7 +47,9 @@ def method_factories(model, text=False):
         "GradientRollout": lambda: GradientRollout(model, text=text),
         "CDAM": lambda: CDAM(model, layer="last", text=text),
         "GMAR": lambda: GMAR(model, text=text),
-        "Ours": lambda: (TextLAGRA if text else LAGRA)(model),
+        "Ours": lambda: (TextLAGRA if text else LAGRA)(
+            model, config=LAGRAConfig(normalize="none")
+        ),
     }
 
 
@@ -297,7 +300,7 @@ def save_metadata(output_dir, config, model, checkpoint_path=None, method_detail
             "GradientRollout": "gradient-only adaptation: positive attention*gradient, head mean, add identity, row normalize, M_L...M_1; no LRP",
             "CDAM": "user-supplied last-layer attention-gradient implementation; not independently verified against the published method",
             "GMAR": "user-supplied head-weighted attention implementation; not independently verified against the published method",
-            "Ours": "LAGRA/TextLAGRA; double normalization; CLS row-vector rollout; M_1...M_L",
+            "Ours": "LAGRA/TextLAGRA; no row normalization; CLS row-vector rollout; M_1...M_L",
         },
         "gradient_rollout_reference": {
             "paper": "Chefer et al., Transformer Interpretability Beyond Attention Visualization, CVPR 2021 [28]",

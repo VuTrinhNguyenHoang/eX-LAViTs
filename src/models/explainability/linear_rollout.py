@@ -65,7 +65,7 @@ class LAGRAConfig:
     use_grad: bool = True
     use_relu: bool = True
     use_residual: bool = True
-    normalize: str = "double"
+    normalize: str = "none"
     rollout: bool = True
 
 

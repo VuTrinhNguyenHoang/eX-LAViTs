@@ -1,0 +1,71 @@
+dataset,modality,method,source,auc_del,auc_ins,entropy,cosine_cs
+dogcat,Image,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.22911672679943787,0.845740078225006,0.8355694327337315,0.4397781574912816
+dogcat,Image,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.32551310608875056,0.7386242727434316,0.8618840509178716,1.0000000078201294
+dogcat,Image,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.3062061932880098,0.8338389421006336,0.7672116151493924,-0.12228574590905628
+dogcat,Image,NoRes,matched nonorm ablation; shared checkpoint and samples,0.24155094938511337,0.8248180325456032,0.586945084649184,0.0
+dogcat,Image,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.22885026103559966,0.8301897271515719,0.6013811565364708,0.18685917547700617
+dogcat,Image,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.27119693071418394,0.7991611410023138,0.8496048404071229,0.5614720227236549
+dogcat,Image,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.30659061855837166,0.7867136691902119,0.8685529207720031,0.49775545354391215
+animal,Image,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.3354317950842354,0.8054812296975801,0.7880801055332978,0.5427950236100514
+animal,Image,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.41323306153224737,0.7491028365631281,0.8226613604289021,1.0000000099651516
+animal,Image,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.3666066369697906,0.7965762891450244,0.6373970030003397,0.3009831029776933
+animal,Image,NoRes,matched nonorm ablation; shared checkpoint and samples,0.3555743540339519,0.7630289277138984,0.6668819646148331,0.0
+animal,Image,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.3555743447677348,0.7630300084785047,0.6668819696260089,0.5198602897253295
+animal,Image,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.360703164527231,0.8000483788377531,0.8321973695945728,0.6375182536779903
+animal,Image,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.3642753149279104,0.8078804231512091,0.8436451536654758,0.6237231808598154
+stl10,Image,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.4647101429140738,0.6270465477050157,0.9853386395533412,0.029345158306978193
+stl10,Image,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.526586731483589,0.5752575209560591,0.9997696021610978,1.0000000048428774
+stl10,Image,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.4630936452339223,0.6262339310789049,0.8975074043279095,0.009999288211838575
+stl10,Image,NoRes,matched nonorm ablation; shared checkpoint and samples,0.4967754771110717,0.6041720652294296,0.9750887626540041,0.0
+stl10,Image,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.49667775234981837,0.6045487423697357,0.974996922960665,0.033755845783662156
+stl10,Image,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.5016237705920042,0.6003649270389294,0.9750096378440787,-0.0001966458277820493
+stl10,Image,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.5020607489279556,0.6000549094500592,0.9745863859776287,0.0006851178289252857
+cifar10,Image,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.45664614227954237,0.5873565826406018,0.9170988767382184,0.2311470469881897
+cifar10,Image,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.49589326124900746,0.5484205729489721,0.9762244652191672,1.0000000110827387
+cifar10,Image,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.45669158819381384,0.5855159307153656,0.659030168076657,0.1702360692728689
+cifar10,Image,NoRes,matched nonorm ablation; shared checkpoint and samples,0.46448621528813067,0.5799875425443028,0.8220422606589454,0.026506439654708735
+cifar10,Image,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.4624153698489043,0.5817907807423033,0.815413512148653,0.26172179993454847
+cifar10,Image,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.4733910629407589,0.5781535907131061,0.9124153020615864,0.2561570389785629
+cifar10,Image,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.4746676864253551,0.5777792765207191,0.9107190940232537,0.2518562501901215
+medmnist,Image,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.32160946623278397,0.5970879305417783,0.9340071508482912,0.3033145285833463
+medmnist,Image,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.3736256235569557,0.5608973806107961,0.9595504174985023,1.0000000121968764
+medmnist,Image,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.35263637518544033,0.5714151510699269,0.8004840922772964,-0.012586719910959127
+medmnist,Image,NoRes,matched nonorm ablation; shared checkpoint and samples,0.3447952960014738,0.5600639872381227,0.8858629419359099,0.0
+medmnist,Image,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.34456580210646093,0.5603678344768566,0.8856382359769741,0.3175368649860266
+medmnist,Image,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.32032083827047925,0.6087498722672223,0.9399907922703455,0.17722135850996926
+medmnist,Image,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.31994723960376875,0.609119379797004,0.9401554790956145,0.17388771940926476
+agnews,Text,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.20495275909752608,0.983015217022799,0.6691898119024128,0.32921905181370675
+agnews,Text,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.27690768435616436,0.9669392312445217,0.9981811386207208,1.0000000083446503
+agnews,Text,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.24963914771870363,0.9757617305195615,0.48897320231875857,0.08464047648318228
+agnews,Text,NoRes,matched nonorm ablation; shared checkpoint and samples,0.8911552948797882,0.4602367842534785,0.9949263749842165,0.0
+agnews,Text,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.8911552948797882,0.4602367842534785,0.9949263746020329,0.45581648075953124
+agnews,Text,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.12563587148027186,0.982994630141925,0.9715797966669731,0.24194918438042806
+agnews,Text,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.12935848995000918,0.9830140192866952,0.9485862188549984,0.2700040827387784
+imdb,Text,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.03967286119764088,0.9858442780497916,0.8190842288674741,-0.09858818016800797
+imdb,Text,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.5614308445910324,0.6911668100255629,0.9986496579614706,1.0000000154972077
+imdb,Text,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.12405433392102573,0.9858442753714425,0.691567731763479,-0.13354995057918131
+imdb,Text,NoRes,matched nonorm ablation; shared checkpoint and samples,0.7774317290619582,0.5850746434195322,0.9985965848798669,0.0
+imdb,Text,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.7774317290619582,0.5850746434195322,0.9985965944344585,-0.3763352794875391
+imdb,Text,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.04772805595477025,0.9857148868418065,0.9872202665720544,-0.09240936303598574
+imdb,Text,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.04502941690119039,0.9858442780497916,0.9837610702162667,-0.13314302710343326
+movie-reviews,Text,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.08744028757802572,0.9171879022538204,0.95422843074179,-0.5902226161956787
+movie-reviews,Text,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.4559182938624303,0.5723058931231807,0.9999921671440148,0.9999997454881668
+movie-reviews,Text,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.11836028686004121,0.9186859304744472,0.8399000912715525,-0.42908622324466705
+movie-reviews,Text,NoRes,matched nonorm ablation; shared checkpoint and samples,0.651893679324243,0.4155535258709023,0.9990632682102756,0.0
+movie-reviews,Text,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.651893679324243,0.4155535258709023,0.9990632674459082,-0.22322092296555637
+movie-reviews,Text,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.1472741107642262,0.8724989685493985,0.9963739663306367,-0.6243612414598465
+movie-reviews,Text,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.14809672828637277,0.8756324162861442,0.9946823671461148,-0.6250109511613846
+esc50,Audio,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.2597139746403335,0.4487378890570159,0.9457104171020747,0.24931151757613407
+esc50,Audio,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.28975983856547527,0.42076989088409766,0.9868556547571768,1.0000000098347663
+esc50,Audio,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.2946483085675849,0.4003397963082479,0.7685776096868366,-0.11453186703859615
+esc50,Audio,NoRes,matched nonorm ablation; shared checkpoint and samples,0.3052975910566122,0.41592495522506767,0.9366876417892364,0.0
+esc50,Audio,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.3043073579131202,0.4171500148767805,0.9365955051513102,0.08580438976059668
+esc50,Audio,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.2851721190857197,0.436554048034713,0.9579330472617725,0.2148268469463801
+esc50,Audio,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.28541049730492607,0.4365204031365517,0.9577422060987912,0.20967834736326155
+speechcommands,Audio,LAGRA (full),matched nonorm ablation; shared checkpoint and samples,0.17283458229479293,0.41367400185878045,0.7243464438950448,0.7583420034646988
+speechcommands,Audio,NoGrad,matched nonorm ablation; shared checkpoint and samples,0.18714303194761886,0.3930287426754493,0.7433974092120123,1.0000000056028366
+speechcommands,Audio,NoReLU,matched nonorm ablation; shared checkpoint and samples,0.2509683054176596,0.2878480224487821,0.5740062737073349,0.38212113203760234
+speechcommands,Audio,NoRes,matched nonorm ablation; shared checkpoint and samples,0.1994695636542079,0.40331448233726386,0.606589855423274,6.318412318684352e-08
+speechcommands,Audio,NoRoll,matched nonorm ablation; shared checkpoint and samples,0.1994695636542079,0.40331448233726386,0.6065898554119813,0.7186380135975778
+speechcommands,Audio,SingleNorm,matched nonorm ablation; shared checkpoint and samples,0.17757211397947273,0.3953660406996653,0.7428565818314017,0.8308089942932129
+speechcommands,Audio,WithNorm,matched nonorm ablation; shared checkpoint and samples,0.17751963718720185,0.3905134819640513,0.7614831633022141,0.8257521654963493
